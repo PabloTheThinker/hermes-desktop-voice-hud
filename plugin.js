@@ -859,10 +859,13 @@ export default {
         area: 'panes',
         title: 'voice hud',
         data: {
+          // Floating card above the layout tree. uncloseable avoids the core
+          // "close pane → disable whole plugin" path (easy to trip on a HUD).
           placement: 'floating',
           anchor: 'top-right',
           width: '300px',
-          height: '520px'
+          height: '520px',
+          uncloseable: true
         },
         render: () => jsx(HudPane, {})
       },

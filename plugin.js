@@ -40,7 +40,7 @@ const $liveText = atom('')
 const $agentText = atom('')
 const $elapsed = atom(0)
 const $error = atom('')
-/** @type {import('nanostores').WritableAtom<ScrapedAtt[]>} */
+/** Staged composer attachment chips (images/files) scraped from the dock. */
 const $images = atom(/** @type {ScrapedAtt[]} */ ([]))
 
 /**

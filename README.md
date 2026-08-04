@@ -2,21 +2,21 @@
 
 Iron Man–inspired **live speech HUD** plugin for [Hermes Desktop](https://hermes-agent.nousresearch.com/).
 
-**Deep integration:** skins the *native* composer voice conversation (same loop as the AudioLines control / Ctrl+B) — STT, barge-in, TTS, and stop-word stay in core. The HUD is glass on top of the typing dock: **YOU** chip, film-style **fiber orb**, **REC/TCG**, and **AGENT** chip streaming `message.delta`.
+**One surface with Desktop:** skins the *native* composer voice loop (AudioLines / Ctrl+B). STT, barge-in, TTS, stop-word stay in core. The HUD uses the same chrome language as the built-in voice pill (`rounded-xl border-border/55 bg-muted/55`) and mounts on `composer.top` + a mic control on `composer.actions` — not a separate app card. Film-style fiber orb + YOU/AGENT captions while you talk.
 
 > Fan-inspired UI only. Not affiliated with Marvel, Disney, or Iron Man / J.A.R.V.I.S.
 
 ## Features
 
-- **Composer-mounted HUD** (`composer.top`) — sits above the typing / voice dock
-- **Native voice deep-link** — Listen toggles the same conversation as the core voice button (`hermes:composer-voice-toggle`)
-- **Floating card** (optional, uncloseable) for a larger workshop view
-- **YOU chip** — live caption (Web Speech interim when available + last user bubble)
-- **Fiber orb** — dense multicolor strand sphere (Mark II workshop language), driven by mic level / phase
-- **REC + TCG** chrome while the native loop is live
-- **AGENT chip** — streams gateway `message.delta`
-- **No second STT path** — core still owns silence end, Whisper, barge-in, TTS
-- **Status bar chip** + palette + **⌘/Ctrl+Shift+V**
+- **Composer-native** — `composer.top` HUD + `composer.actions` mic control (with send/model)
+- **Same voice engine as Desktop** — toggles core conversation via `hermes:composer-voice-toggle`
+- **Hermes design tokens** — matches stock VoiceActivity strip (flat, no nested product chrome)
+- **Hides stock pill while live** — one voice chrome, not two stacked bars
+- **YOU caption** — film STT chip (interim Web Speech when available)
+- **Fiber orb** — dense toroidal strand sphere (blue core → green/yellow rim)
+- **AGENT line** — `message.delta` stream under the caption
+- **Workshop pane optional** — floating canvas OFF by default (`Voice: Toggle workshop`)
+- Status chip + palette + **Mod+Shift+V**
 
 ## Requirements
 

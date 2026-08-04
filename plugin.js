@@ -770,7 +770,7 @@ function WorkshopPane() {
           })
         ]
       }),
-      jsx(Separator, {}),
+      jsx('div', { className: 'h-px bg-(--ui-stroke-tertiary)' }),
       jsx(ComposerIntegratedHud, {}),
       !active
         ? jsx(Button, {

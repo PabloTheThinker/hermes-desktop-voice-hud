@@ -2,7 +2,7 @@
 
 Iron Man–inspired **live speech HUD** plugin for [Hermes Desktop](https://hermes-agent.nousresearch.com/).
 
-While you talk, a glass **speech chip** fills with your words, a multicolor **fiber orb** reacts to the mic, and a **REC / TCG** strip shows capture state. When the agent replies, a second chip streams the answer from gateway `message.delta` events.
+**Deep integration:** skins the *native* composer voice conversation (same loop as the AudioLines control / Ctrl+B) — STT, barge-in, TTS, and stop-word stay in core. The HUD is glass on top of the typing dock: **YOU** chip, film-style **fiber orb**, **REC/TCG**, and **AGENT** chip streaming `message.delta`.
 
 > Fan-inspired UI only. Not affiliated with Marvel, Disney, or Iron Man / J.A.R.V.I.S.
 
@@ -69,21 +69,20 @@ cp plugin.js ~/.hermes/profiles/<name>/desktop-plugins/voice-hud/
 
 | Action | How |
 |--------|-----|
-| Start / stop | Status chip, HUD **Listen/Stop**, palette, or `Mod+Shift+V` |
-| Send utterance | Speak, then pause ~1.4s (silence end) |
-| Cancel HUD by voice | Say **stop** alone |
-| Auto-send off | Toggle **Auto-send** in the pane (capture only) |
-| One-shot vs loop | Toggle **Continuous** |
+| Start / end | Status chip, HUD **Listen/End**, palette, `Mod+Shift+V`, or core voice button |
+| Speak / send | Native conversation rules (silence end, barge-in, stop-word) |
+| See captions | YOU chip above the composer (and optional floating card) |
+| See agent | AGENT chip streams while the reply generates |
 
 ### Flow
 
 ```
-mic open → REC + orb
-   → silence after speech
-   → /api/audio/transcribe  (Hermes STT)
-   → prompt.submit          (active session)
+Listen / Mod+Shift+V
+   → dispatch hermes:composer-voice-toggle  (native voice conversation)
+   → core: mic · VAD · STT · prompt · TTS · barge-in
+   → HUD: YOU chip + fiber orb + REC/TCG
    → AGENT chip streams message.delta
-   → continuous? re-open mic after message.complete
+   → End → toggle native voice off
 ```
 
 ## Layout

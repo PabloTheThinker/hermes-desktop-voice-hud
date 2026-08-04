@@ -1,19 +1,23 @@
 /**
  * voice-hud — Iron Man–inspired live speech HUD for Hermes Desktop.
  *
- * Floating glass chip shows what YOU are saying (live STT) + a fiber orb
- * while the mic is open; a second chip streams the agent's reply from
- * gateway message.delta events. Final user utterances submit via
- * prompt.submit on the active session.
+ * Deep mode (default): skins the *native* composer voice conversation
+ * (same loop as the AudioLines / Ctrl+B control). No second STT pipeline,
+ * no double mic fight — we toggle core voice and paint the HUD from live
+ * phase + gateway deltas + a film-style fiber orb.
  *
- * Install: copy this folder to $HERMES_HOME/desktop-plugins/voice-hud/
- * then ⌘/Ctrl+K → "Reload desktop plugins".
+ * Surfaces:
+ *   - composer.top  — HUD sits above the typing / voice dock
+ *   - floating pane — optional wide card (uncloseable)
+ *   - statusBar chip + palette + Mod+Shift+V
  *
- * Plain ESM, uncompiled — jsx() only. Imports: @hermes/plugin-sdk, react*.
+ * Install: $HERMES_HOME/desktop-plugins/voice-hud/plugin.js
+ * Reload: ⌘/Ctrl+K → "Reload desktop plugins"
  */
 import {
   Badge,
   Button,
+  COMPOSER_AREAS,
   KEYBINDS_AREA,
   PALETTE_AREA,
   STATUSBAR_AREAS,
@@ -28,69 +32,30 @@ import { useEffect, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'voice-hud'
+const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
 
-/** @typedef {'idle' | 'listening' | 'transcribing' | 'submitting' | 'error'} HudPhase */
+/** @typedef {'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'} Phase */
 
-const $enabled = atom(false)
-const $phase = atom(/** @type {HudPhase} */ ('idle'))
+const $hudOn = atom(true)
+const $nativeActive = atom(false)
+const $phase = atom(/** @type {Phase} */ ('idle'))
+const $level = atom(0)
 const $userText = atom('')
 const $agentText = atom('')
-const $level = atom(0)
 const $elapsed = atom(0)
+const $floating = atom(true)
 const $error = atom('')
-const $autoSubmit = atom(true)
-const $continuous = atom(true)
-const $hudVisible = atom(true)
 
-// Imperative session for mic / loops (not React state — avoids stale closures).
-const runtime = {
+const meter = {
   stream: null,
-  recorder: null,
-  chunks: [],
-  audioCtx: null,
+  ctx: null,
   analyser: null,
   raf: 0,
   timer: 0,
   startedAt: 0,
-  heardSpeech: false,
-  silenceAt: null,
-  loop: false,
-  busyAgent: false,
   speechRec: null,
-  disposed: false
-}
-
-const SILENCE_RMS = 0.018
-const SILENCE_END_MS = 1400
-const MIN_SPEECH_MS = 450
-const MAX_UTTERANCE_MS = 45_000
-const IDLE_TIMEOUT_MS = 18_000
-
-function desktopApi() {
-  return typeof window !== 'undefined' ? window.hermesDesktop : null
-}
-
-function profileBody() {
-  const profile = host.state.profile.get()
-  return profile ? { profile } : {}
-}
-
-async function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result || ''))
-    reader.onerror = () => reject(reader.error || new Error('read failed'))
-    reader.readAsDataURL(blob)
-  })
-}
-
-function pickMime() {
-  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4']
-  if (typeof MediaRecorder === 'undefined') return ''
-  for (const t of types) {
-    if (MediaRecorder.isTypeSupported(t)) return t
-  }
-  return ''
+  mo: null,
+  poll: 0
 }
 
 function formatTcg(ms) {
@@ -103,60 +68,52 @@ function formatTcg(ms) {
   return `${pad(h)}:${pad(m)}:${pad(s)}.${pad(f)}`
 }
 
-function rmsFromTimeDomain(data) {
-  let sum = 0
-  for (let i = 0; i < data.length; i++) {
-    const v = (data[i] - 128) / 128
-    sum += v * v
+function toggleNativeVoice() {
+  try {
+    window.dispatchEvent(
+      new CustomEvent(VOICE_TOGGLE_EVENT, { detail: { target: 'main' } })
+    )
+    return true
+  } catch (err) {
+    $error.set(err instanceof Error ? err.message : String(err))
+    return false
   }
-  return Math.sqrt(sum / Math.max(1, data.length))
 }
 
-function stopTracks() {
-  if (runtime.raf) {
-    cancelAnimationFrame(runtime.raf)
-    runtime.raf = 0
+function startHudSession() {
+  $hudOn.set(true)
+  $error.set('')
+  $agentText.set('')
+  if (!$nativeActive.get()) {
+    haptic('open')
+    toggleNativeVoice()
   }
-  if (runtime.timer) {
-    clearInterval(runtime.timer)
-    runtime.timer = 0
+}
+
+function stopHudSession() {
+  if ($nativeActive.get()) {
+    haptic('close')
+    toggleNativeVoice()
   }
-  try {
-    runtime.recorder?.state === 'recording' && runtime.recorder.stop()
-  } catch {
-    /* ignore */
-  }
-  runtime.recorder = null
-  runtime.stream?.getTracks().forEach(t => t.stop())
-  runtime.stream = null
-  try {
-    runtime.audioCtx?.close()
-  } catch {
-    /* ignore */
-  }
-  runtime.audioCtx = null
-  runtime.analyser = null
-  if (runtime.speechRec) {
-    try {
-      runtime.speechRec.onresult = null
-      runtime.speechRec.onerror = null
-      runtime.speechRec.onend = null
-      runtime.speechRec.stop()
-    } catch {
-      /* ignore */
-    }
-    runtime.speechRec = null
-  }
+  $hudOn.set(false)
+  stopMeter()
+  stopSpeechSoft()
+  $phase.set('idle')
   $level.set(0)
 }
 
-function setPhase(p) {
-  $phase.set(p)
+function toggleHud() {
+  if ($nativeActive.get() || ($hudOn.get() && $phase.get() !== 'idle')) {
+    stopHudSession()
+  } else {
+    startHudSession()
+  }
 }
 
-function startSpeechRecognitionSoft() {
+// --- Soft Web Speech (interim YOU chip only; core still owns submit) ---
+function startSpeechSoft() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition
-  if (!SR) return
+  if (!SR || meter.speechRec) return
   try {
     const rec = new SR()
     rec.continuous = true
@@ -174,11 +131,9 @@ function startSpeechRecognitionSoft() {
       const text = (final || interim).trim()
       if (text) $userText.set(text)
     }
-    rec.onerror = () => {
-      /* optional path — Hermes STT is primary */
-    }
+    rec.onerror = () => {}
     rec.onend = () => {
-      if (runtime.loop && $enabled.get() && runtime.speechRec === rec) {
+      if (meter.speechRec === rec && $nativeActive.get() && $phase.get() === 'listening') {
         try {
           rec.start()
         } catch {
@@ -187,270 +142,200 @@ function startSpeechRecognitionSoft() {
       }
     }
     rec.start()
-    runtime.speechRec = rec
+    meter.speechRec = rec
   } catch {
-    /* Web Speech unavailable in this Electron build */
+    /* Electron often lacks Web Speech — fine */
   }
 }
 
-async function openMic() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error('Microphone API unavailable')
+function stopSpeechSoft() {
+  if (!meter.speechRec) return
+  try {
+    meter.speechRec.onresult = null
+    meter.speechRec.onend = null
+    meter.speechRec.stop()
+  } catch {
+    /* ignore */
   }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    }
-  })
-  runtime.stream = stream
+  meter.speechRec = null
+}
 
-  const AC = window.AudioContext || window.webkitAudioContext
-  if (AC) {
+// --- Level meter (shared-mic best-effort; never submits audio) ---
+function rmsFromTimeDomain(data) {
+  let sum = 0
+  for (let i = 0; i < data.length; i++) {
+    const v = (data[i] - 128) / 128
+    sum += v * v
+  }
+  return Math.sqrt(sum / Math.max(1, data.length))
+}
+
+async function startMeter() {
+  if (meter.analyser || !navigator.mediaDevices?.getUserMedia) return
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    })
+    meter.stream = stream
+    const AC = window.AudioContext || window.webkitAudioContext
+    if (!AC) return
     const ctx = new AC()
     const source = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 512
-    analyser.smoothingTimeConstant = 0.75
+    analyser.smoothingTimeConstant = 0.72
     source.connect(analyser)
-    runtime.audioCtx = ctx
-    runtime.analyser = analyser
+    meter.ctx = ctx
+    meter.analyser = analyser
     void ctx.resume()
-
     const data = new Uint8Array(analyser.fftSize)
     const tick = () => {
-      if (!runtime.analyser) return
-      runtime.analyser.getByteTimeDomainData(data)
+      if (!meter.analyser) return
+      meter.analyser.getByteTimeDomainData(data)
       const rms = rmsFromTimeDomain(data)
-      const level = Math.min(1, rms * 6)
-      $level.set(level)
-
-      const now = performance.now()
-      if (rms >= SILENCE_RMS) {
-        runtime.heardSpeech = true
-        runtime.silenceAt = null
-      } else if (runtime.heardSpeech) {
-        if (runtime.silenceAt == null) runtime.silenceAt = now
-        else if (now - runtime.silenceAt >= SILENCE_END_MS) {
-          void endUtterance('silence')
-          return
-        }
-      } else if (now - runtime.startedAt >= IDLE_TIMEOUT_MS) {
-        void endUtterance('idle')
-        return
-      }
-
-      if (now - runtime.startedAt >= MAX_UTTERANCE_MS) {
-        void endUtterance('max')
-        return
-      }
-
-      runtime.raf = requestAnimationFrame(tick)
+      $level.set(Math.min(1, rms * 7))
+      meter.raf = requestAnimationFrame(tick)
     }
-    runtime.raf = requestAnimationFrame(tick)
+    meter.raf = requestAnimationFrame(tick)
+  } catch {
+    // Mic exclusive to core — animate from phase only
   }
-
-  runtime.chunks = []
-  runtime.heardSpeech = false
-  runtime.silenceAt = null
-  runtime.startedAt = performance.now()
-  $elapsed.set(0)
-  runtime.timer = window.setInterval(() => {
-    $elapsed.set(performance.now() - runtime.startedAt)
-  }, 100)
-
-  const mime = pickMime()
-  const recorder = mime
-    ? new MediaRecorder(stream, { mimeType: mime })
-    : new MediaRecorder(stream)
-  runtime.recorder = recorder
-  recorder.ondataavailable = e => {
-    if (e.data && e.data.size > 0) runtime.chunks.push(e.data)
-  }
-  recorder.start(250)
-  startSpeechRecognitionSoft()
-  setPhase('listening')
-  if (!$userText.get()) $userText.set('')
 }
 
-async function endUtterance(reason) {
-  if (!$enabled.get() && reason !== 'stop') return
-  if ($phase.get() !== 'listening') return
-
-  const minOk = performance.now() - runtime.startedAt >= MIN_SPEECH_MS
-  const heard = runtime.heardSpeech && minOk
-  const recorder = runtime.recorder
-  const chunks = runtime.chunks
-
-  if (runtime.raf) {
-    cancelAnimationFrame(runtime.raf)
-    runtime.raf = 0
-  }
-  if (runtime.timer) {
-    clearInterval(runtime.timer)
-    runtime.timer = 0
-  }
-
-  const blob = await new Promise(resolve => {
-    if (!recorder || recorder.state === 'inactive') {
-      resolve(chunks.length ? new Blob(chunks, { type: chunks[0]?.type || 'audio/webm' }) : null)
-      return
-    }
-    recorder.onstop = () => {
-      resolve(chunks.length ? new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }) : null)
-    }
-    try {
-      recorder.stop()
-    } catch {
-      resolve(null)
-    }
-  })
-
-  // Keep stream only if continuous; release analyser between turns to save CPU.
+function stopMeter() {
+  if (meter.raf) cancelAnimationFrame(meter.raf)
+  meter.raf = 0
+  if (meter.timer) clearInterval(meter.timer)
+  meter.timer = 0
   try {
-    runtime.audioCtx?.close()
+    meter.ctx?.close()
   } catch {
     /* ignore */
   }
-  runtime.audioCtx = null
-  runtime.analyser = null
-  runtime.recorder = null
+  meter.ctx = null
+  meter.analyser = null
+  meter.stream?.getTracks().forEach(t => t.stop())
+  meter.stream = null
   $level.set(0)
+}
 
-  if (!heard || !blob || blob.size < 256) {
-    if ($enabled.get() && $continuous.get() && reason !== 'stop') {
-      // Release and re-open for a clean next turn.
-      runtime.stream?.getTracks().forEach(t => t.stop())
-      runtime.stream = null
-      try {
-        await openMic()
-      } catch (err) {
-        fail(err)
+function startElapsed() {
+  meter.startedAt = performance.now()
+  $elapsed.set(0)
+  if (meter.timer) clearInterval(meter.timer)
+  meter.timer = window.setInterval(() => {
+    $elapsed.set(performance.now() - meter.startedAt)
+  }, 100)
+}
+
+// --- Detect native voice UI state via DOM (composer ConversationPill) ---
+function detectNativePhase() {
+  // Core paints sr-only role=status with listening / speaking / … labels
+  const statuses = document.querySelectorAll('[data-slot="composer-root"] [role="status"], [data-slot="composer-dock"] [role="status"]')
+  let hit = ''
+  for (const el of statuses) {
+    const t = (el.textContent || '').trim().toLowerCase()
+    if (!t) continue
+    if (t.includes('listen')) hit = 'listening'
+    else if (t.includes('transcrib') || t.includes('dictat')) hit = 'transcribing'
+    else if (t.includes('think')) hit = 'thinking'
+    else if (t.includes('speak') || t.includes('reading')) hit = 'speaking'
+    else if (t.includes('mut')) hit = 'listening'
+    if (hit) break
+  }
+
+  // End / conversation pill visible ⇒ voice conversation active
+  const endBtn = document.querySelector(
+    '[data-slot="composer-root"] button[aria-label*="End" i], [data-slot="composer-dock"] button[aria-label*="End" i]'
+  )
+  const startBtn = document.querySelector(
+    '[data-slot="composer-root"] button[aria-label*="Start voice" i], [data-slot="composer-dock"] button[aria-label*="voice conversation" i]'
+  )
+  const active = Boolean(endBtn) || (hit && hit !== 'idle')
+
+  // Playback activity strip
+  if (!hit) {
+    const body = document.body?.innerText || ''
+    // light fallback only near composer
+  }
+
+  // VoiceActivity strip text
+  if (!hit) {
+    const strips = document.querySelectorAll('[data-slot="composer-root"] [aria-live="polite"]')
+    for (const el of strips) {
+      const t = (el.textContent || '').toLowerCase()
+      if (t.includes('dictat') || t.includes('recording')) {
+        hit = 'listening'
+        break
       }
-      return
-    }
-    stopTracks()
-    setPhase('idle')
-    return
-  }
-
-  setPhase('transcribing')
-  $error.set('')
-
-  try {
-    const api = desktopApi()
-    if (!api?.api) throw new Error('Desktop audio bridge unavailable (hermesDesktop.api)')
-
-    const dataUrl = await blobToDataUrl(blob)
-    const res = await api.api({
-      path: '/api/audio/transcribe',
-      method: 'POST',
-      ...profileBody(),
-      body: { data_url: dataUrl, mime_type: blob.type || 'audio/webm' },
-      timeoutMs: Math.min(120_000, 15_000 + Math.floor(dataUrl.length / 40))
-    })
-
-    const text = String(res?.transcript || res?.text || '').trim()
-    if (!text) {
-      if ($enabled.get() && $continuous.get()) {
-        runtime.stream?.getTracks().forEach(t => t.stop())
-        runtime.stream = null
-        await openMic()
-        return
+      if (t.includes('transcrib')) {
+        hit = 'transcribing'
+        break
       }
-      setPhase('idle')
-      return
-    }
-
-    $userText.set(text)
-
-    // Stop-word (simple): bare "stop" ends HUD without submitting.
-    if (/^stop[.!?]?$/i.test(text)) {
-      await stopHud({ notify: true, message: 'Voice HUD stopped' })
-      return
-    }
-
-    if ($autoSubmit.get()) {
-      await submitPrompt(text)
-    } else {
-      setPhase('idle')
-      host.notify({ kind: 'info', message: 'Captured (auto-submit off): ' + text.slice(0, 80) })
-    }
-
-    if ($enabled.get() && $continuous.get()) {
-      // Wait for agent turn to finish before re-arming mic (barge is core app).
-      if (runtime.busyAgent) {
-        setPhase('idle')
-        return
+      if (t.includes('speaking') || t.includes('reading') || t.includes('preparing')) {
+        hit = 'speaking'
+        break
       }
-      runtime.stream?.getTracks().forEach(t => t.stop())
-      runtime.stream = null
-      await openMic()
-    } else {
-      stopTracks()
-      setPhase('idle')
-      $enabled.set(false)
     }
-  } catch (err) {
-    fail(err)
   }
+
+  return { active, phase: /** @type {Phase} */ (active ? hit || 'listening' : 'idle') }
 }
 
-async function submitPrompt(text) {
-  const sessionId = host.state.activeSessionId.get()
-  if (!sessionId) {
-    throw new Error('No active chat session — open a chat first')
-  }
-  setPhase('submitting')
-  runtime.busyAgent = true
-  $agentText.set('')
-  await host.request('prompt.submit', { session_id: sessionId, text })
+function scrapeLastUserBubble() {
+  // assistant-ui user messages — best-effort
+  const nodes = document.querySelectorAll(
+    '[data-role="user"], [data-message-role="user"], [data-slot*="user-message"]'
+  )
+  if (!nodes.length) return ''
+  const last = nodes[nodes.length - 1]
+  const text = (last.textContent || '').trim()
+  return text.slice(0, 400)
 }
 
-function fail(err) {
-  const msg = err instanceof Error ? err.message : String(err)
-  $error.set(msg)
-  setPhase('error')
-  stopTracks()
-  $enabled.set(false)
-  host.notify({ kind: 'error', message: 'Voice HUD: ' + msg })
+function wireDomObserver() {
+  if (meter.poll) return
+  let lastActive = false
+  meter.poll = window.setInterval(() => {
+    const { active, phase } = detectNativePhase()
+    const was = $nativeActive.get()
+    $nativeActive.set(active)
+
+    if (active && !was) {
+      $hudOn.set(true)
+      $userText.set('')
+      $agentText.set('')
+      startElapsed()
+      startMeter()
+      startSpeechSoft()
+    } else if (!active && was) {
+      stopMeter()
+      stopSpeechSoft()
+      $phase.set('idle')
+      $elapsed.set(0)
+    }
+
+    if (active) {
+      $phase.set(phase)
+      if (phase === 'thinking' || phase === 'speaking' || phase === 'transcribing') {
+        const bubble = scrapeLastUserBubble()
+        if (bubble && bubble.length > ($userText.get() || '').length) {
+          $userText.set(bubble)
+        }
+      }
+      if (!meter.timer && active) startElapsed()
+    }
+
+    lastActive = active
+  }, 200)
 }
 
-async function startHud() {
-  if ($enabled.get()) return
-  $error.set('')
-  $userText.set('')
-  $agentText.set('')
-  $hudVisible.set(true)
-  $enabled.set(true)
-  runtime.loop = true
-  runtime.busyAgent = false
-  try {
-    await openMic()
-    haptic('tap')
-    host.notify({ kind: 'info', message: 'Voice HUD listening — speak, pause to send' })
-  } catch (err) {
-    fail(err)
-  }
+function stopDomObserver() {
+  if (meter.poll) clearInterval(meter.poll)
+  meter.poll = 0
 }
 
-async function stopHud(opts = {}) {
-  runtime.loop = false
-  $enabled.set(false)
-  stopTracks()
-  setPhase('idle')
-  if (opts.notify) {
-    host.notify({ kind: 'info', message: opts.message || 'Voice HUD stopped' })
-  }
-}
-
-function toggleHud() {
-  if ($enabled.get()) void stopHud({ notify: true })
-  else void startHud()
-}
-
-// --- Gateway: agent speech chip + re-arm after turn ---
+// --- Gateway agent chip ---
 function wireGateway() {
   return host.onEvent('*', event => {
     if (!event || typeof event !== 'object') return
@@ -461,24 +346,23 @@ function wireGateway() {
     if (sid && active && sid !== active) return
 
     if (type === 'message.start') {
-      runtime.busyAgent = true
       $agentText.set('')
+      if ($nativeActive.get()) $phase.set('thinking')
     } else if (type === 'message.delta') {
       const chunk = String(payload.text || payload.delta || '')
-      if (chunk) $agentText.set(($agentText.get() + chunk).slice(-800))
-    } else if (type === 'message.complete' || type === 'error') {
-      runtime.busyAgent = false
-      // Re-arm continuous listen after agent finishes.
-      if ($enabled.get() && $continuous.get() && $phase.get() === 'idle') {
-        void openMic().catch(fail)
+      if (chunk) {
+        $agentText.set(($agentText.get() + chunk).slice(-900))
+        if ($nativeActive.get()) $phase.set('speaking')
       }
+    } else if (type === 'message.complete') {
+      // native loop returns to listening
+      if ($nativeActive.get()) $phase.set('listening')
     }
   })
 }
 
-// --- UI -----------------------------------------------------------------
-
-function FiberOrb() {
+// --- Film-accurate fiber orb (Mark II workshop) ---
+function FiberOrb({ size = 132 }) {
   const canvasRef = useRef(null)
   const level = useValue($level)
   const phase = useValue($phase)
@@ -494,89 +378,106 @@ function FiberOrb() {
     if (!ctx) return
 
     let raf = 0
-    let t0 = performance.now()
+    const t0 = performance.now()
     const dpr = Math.max(1, window.devicePixelRatio || 1)
+    const S = size
 
-    const resize = () => {
-      const size = 120
-      canvas.width = Math.round(size * dpr)
-      canvas.height = Math.round(size * dpr)
-      canvas.style.width = size + 'px'
-      canvas.style.height = size + 'px'
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    }
-    resize()
+    canvas.width = Math.round(S * dpr)
+    canvas.height = Math.round(S * dpr)
+    canvas.style.width = S + 'px'
+    canvas.style.height = S + 'px'
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-    const strands = 48
+    const STRANDS = 96
     const draw = now => {
       const t = (now - t0) / 1000
-      const size = 120
-      const cx = size / 2
-      const cy = size / 2
-      const live = phaseRef.current === 'listening'
-      const amp = live ? 0.35 + levelRef.current * 0.9 : 0.22
+      const cx = S / 2
+      const cy = S / 2
+      const ph = phaseRef.current
+      const live = ph === 'listening' || ph === 'speaking' || ph === 'transcribing'
+      const base = ph === 'speaking' ? 0.55 : ph === 'listening' ? 0.4 : ph === 'thinking' ? 0.28 : 0.14
+      const amp = base + levelRef.current * (ph === 'speaking' ? 0.55 : 0.95)
 
-      ctx.clearRect(0, 0, size, size)
+      ctx.clearRect(0, 0, S, S)
 
-      // Soft core glow
-      const g = ctx.createRadialGradient(cx, cy, 4, cx, cy, 52)
-      g.addColorStop(0, 'hsla(190, 90%, 60%, 0.35)')
-      g.addColorStop(0.45, 'hsla(140, 80%, 50%, 0.12)')
-      g.addColorStop(1, 'hsla(280, 70%, 50%, 0)')
-      ctx.fillStyle = g
+      // Dark well
+      const well = ctx.createRadialGradient(cx, cy, 2, cx, cy, S * 0.48)
+      well.addColorStop(0, 'hsla(210, 40%, 8%, 0.9)')
+      well.addColorStop(0.55, 'hsla(210, 50%, 12%, 0.35)')
+      well.addColorStop(1, 'hsla(210, 40%, 10%, 0)')
+      ctx.fillStyle = well
       ctx.beginPath()
-      ctx.arc(cx, cy, 52, 0, Math.PI * 2)
+      ctx.arc(cx, cy, S * 0.48, 0, Math.PI * 2)
       ctx.fill()
 
-      for (let i = 0; i < strands; i++) {
-        const hue = (i / strands) * 300 + t * 40
-        const a0 = (i / strands) * Math.PI * 2 + t * (0.6 + (i % 5) * 0.05)
-        const rBase = 18 + (i % 7) * 2.2
+      // Outer halo (cyan → green → magenta)
+      const halo = ctx.createRadialGradient(cx, cy, S * 0.12, cx, cy, S * 0.5)
+      halo.addColorStop(0, `hsla(185, 95%, 60%, ${0.22 + amp * 0.25})`)
+      halo.addColorStop(0.35, `hsla(140, 90%, 55%, ${0.12 + amp * 0.15})`)
+      halo.addColorStop(0.7, `hsla(50, 95%, 55%, ${0.08 + amp * 0.1})`)
+      halo.addColorStop(1, `hsla(300, 85%, 60%, 0)`)
+      ctx.fillStyle = halo
+      ctx.beginPath()
+      ctx.arc(cx, cy, S * 0.5, 0, Math.PI * 2)
+      ctx.fill()
+
+      // Tangled fiber strands — film still language
+      for (let i = 0; i < STRANDS; i++) {
+        const hue = (i / STRANDS) * 320 + t * 55 + (live ? levelRef.current * 40 : 0)
+        const a0 = (i / STRANDS) * Math.PI * 2 + t * (0.35 + (i % 7) * 0.04)
+        const r0 = S * 0.1 + (i % 11) * (S * 0.012)
         ctx.beginPath()
-        for (let s = 0; s <= 28; s++) {
-          const u = s / 28
-          const wobble = Math.sin(t * 3 + i + u * 6) * 6 * amp
-          const r = rBase + u * 22 * amp + wobble
-          const a = a0 + u * 1.7 + Math.sin(t + i) * 0.15
+        const segs = 36
+        for (let s = 0; s <= segs; s++) {
+          const u = s / segs
+          const twist = Math.sin(t * 2.8 + i * 0.35 + u * 8) * S * 0.035 * amp
+          const pulse = Math.sin(t * 4.2 + i + u * 3) * S * 0.02 * amp
+          const r = r0 + u * S * (0.28 + amp * 0.14) + twist + pulse
+          const a = a0 + u * (1.9 + Math.sin(i) * 0.35) + Math.cos(t + i * 0.2) * 0.12 * amp
           const x = cx + Math.cos(a) * r
-          const y = cy + Math.sin(a) * r * 0.92
+          const y = cy + Math.sin(a) * r * 0.94
           if (s === 0) ctx.moveTo(x, y)
           else ctx.lineTo(x, y)
         }
-        ctx.strokeStyle = `hsla(${hue % 360}, 85%, 62%, ${0.25 + amp * 0.45})`
-        ctx.lineWidth = 1.1
+        ctx.strokeStyle = `hsla(${hue % 360}, 92%, ${58 + amp * 12}%, ${0.18 + amp * 0.42})`
+        ctx.lineWidth = 0.85 + (i % 3) * 0.25
         ctx.stroke()
       }
 
-      // Inner ring
+      // Bright inner ring
       ctx.beginPath()
-      ctx.arc(cx, cy, 14 + amp * 10, 0, Math.PI * 2)
-      ctx.strokeStyle = `hsla(190, 90%, 70%, ${0.35 + amp * 0.4})`
-      ctx.lineWidth = 1.5
+      ctx.arc(cx, cy, S * (0.09 + amp * 0.06), 0, Math.PI * 2)
+      ctx.strokeStyle = `hsla(190, 100%, 75%, ${0.4 + amp * 0.45})`
+      ctx.lineWidth = 1.6
       ctx.stroke()
+
+      // Core spark
+      ctx.beginPath()
+      ctx.arc(cx, cy, 2.2 + amp * 3, 0, Math.PI * 2)
+      ctx.fillStyle = `hsla(180, 100%, 90%, ${0.5 + amp * 0.5})`
+      ctx.fill()
 
       raf = requestAnimationFrame(draw)
     }
     raf = requestAnimationFrame(draw)
-
     return () => cancelAnimationFrame(raf)
-  }, [])
+  }, [size])
 
   return jsx('canvas', {
     ref: canvasRef,
     'aria-hidden': true,
-    className: 'block rounded-md'
+    className: 'block mx-auto rounded-md'
   })
 }
 
-function SpeechChip({ label, text, tone }) {
+function SpeechChip({ label, text, tone, caps }) {
   const empty = !text
   return jsxs('div', {
     className: cn(
       'relative w-full overflow-hidden rounded-md border px-2.5 py-2',
-      'bg-[color-mix(in_oklab,var(--background)_72%,transparent)]',
-      'border-[color-mix(in_oklab,var(--ui-accent)_40%,var(--ui-stroke-secondary))]',
-      'shadow-[inset_0_1px_0_color-mix(in_oklab,white_12%,transparent)]',
+      'bg-[color-mix(in_oklab,var(--background)_70%,transparent)]',
+      'border-[color-mix(in_oklab,var(--ui-accent)_42%,var(--ui-stroke-secondary))]',
+      'shadow-[inset_0_1px_0_color-mix(in_oklab,white_14%,transparent)]',
       'backdrop-blur-md'
     ),
     children: [
@@ -584,7 +485,8 @@ function SpeechChip({ label, text, tone }) {
         className: 'mb-1 flex items-center justify-between gap-2',
         children: [
           jsx('span', {
-            className: 'text-[0.625rem] font-medium uppercase tracking-[0.14em] text-(--ui-text-tertiary)',
+            className:
+              'text-[0.625rem] font-medium uppercase tracking-[0.16em] text-(--ui-text-tertiary)',
             children: label
           }),
           tone
@@ -597,11 +499,11 @@ function SpeechChip({ label, text, tone }) {
       }),
       jsx('div', {
         className: cn(
-          'min-h-[1.25rem] text-[0.8125rem] leading-snug tracking-wide',
+          'min-h-[1.15rem] text-[0.8125rem] leading-snug tracking-wide',
           empty ? 'text-(--ui-text-quaternary)' : 'text-foreground',
-          !empty && label === 'YOU' && 'font-semibold uppercase'
+          !empty && caps && 'font-semibold uppercase'
         ),
-        children: empty ? (label === 'YOU' ? '…' : '—') : text
+        children: empty ? '…' : text
       })
     ]
   })
@@ -610,9 +512,12 @@ function SpeechChip({ label, text, tone }) {
 function RecChrome() {
   const phase = useValue($phase)
   const elapsed = useValue($elapsed)
+  const level = useValue($level)
   const live = phase === 'listening'
+  const bars = 10
   return jsxs('div', {
-    className: 'flex items-center justify-between gap-2 text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
+    className:
+      'flex items-center justify-between gap-2 text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
     children: [
       jsxs('div', {
         className: 'flex items-center gap-2',
@@ -620,78 +525,62 @@ function RecChrome() {
           jsx('span', {
             className: cn(
               'inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-semibold tracking-wider',
-              live
-                ? 'bg-destructive/15 text-destructive'
-                : 'bg-muted text-(--ui-text-tertiary)'
+              live ? 'bg-destructive/15 text-destructive' : 'bg-muted text-(--ui-text-tertiary)'
             ),
-            children: live ? '● REC' : '○ STBY'
+            children: live ? '● REC' : phase === 'idle' ? '○ STBY' : '● ' + phase.toUpperCase()
           }),
-          jsx('span', {
-            className: 'font-mono',
-            children: 'TCG ' + formatTcg(elapsed)
-          })
+          jsx('span', { className: 'font-mono', children: 'TCG ' + formatTcg(elapsed) })
         ]
       }),
-      jsx(LevelMeter, {})
+      jsxs('div', {
+        className: 'flex h-3 items-end gap-0.5',
+        'aria-hidden': true,
+        children: Array.from({ length: bars }, (_, i) => {
+          const thresh = (i + 1) / bars
+          const on = level >= thresh * 0.8
+          return jsx(
+            'span',
+            {
+              className: cn(
+                'w-0.5 rounded-full transition-all duration-75',
+                on
+                  ? 'bg-[color-mix(in_oklab,var(--ui-accent)_90%,white)]'
+                  : 'bg-(--ui-stroke-secondary)'
+              ),
+              style: { height: `${28 + thresh * 72}%`, opacity: on ? 1 : 0.4 }
+            },
+            i
+          )
+        })
+      })
     ]
   })
 }
 
-function LevelMeter() {
-  const level = useValue($level)
-  const bars = 8
-  return jsxs('div', {
-    className: 'flex h-3 items-end gap-0.5',
-    'aria-hidden': true,
-    children: Array.from({ length: bars }, (_, i) => {
-      const thresh = (i + 1) / bars
-      const on = level >= thresh * 0.85
-      return jsx('span', {
-        className: cn(
-          'w-0.5 rounded-full transition-all duration-75',
-          on ? 'bg-[color-mix(in_oklab,var(--ui-accent)_90%,white)]' : 'bg-(--ui-stroke-secondary)'
-        ),
-        style: { height: `${30 + thresh * 70}%`, opacity: on ? 1 : 0.45 }
-      }, i)
-    })
-  })
-}
-
-function HudPane() {
-  const enabled = useValue($enabled)
+function HudBody({ compact }) {
+  const native = useValue($nativeActive)
   const phase = useValue($phase)
   const userText = useValue($userText)
   const agentText = useValue($agentText)
   const error = useValue($error)
-  const autoSubmit = useValue($autoSubmit)
-  const continuous = useValue($continuous)
-  const visible = useValue($hudVisible)
-
-  if (!visible && !enabled) {
-    return jsxs('div', {
-      className: 'flex h-full flex-col items-center justify-center gap-2 p-3 text-center text-sm',
-      children: [
-        jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'Voice HUD hidden' }),
-        jsx(Button, {
-          size: 'sm',
-          variant: 'secondary',
-          type: 'button',
-          onClick: () => $hudVisible.set(true),
-          children: 'Show'
-        })
-      ]
-    })
-  }
+  const hudOn = useValue($hudOn)
 
   const userTone =
-    phase === 'listening' || phase === 'transcribing' || phase === 'submitting'
+    phase === 'listening' || phase === 'transcribing'
       ? 'live'
-      : phase === 'error'
-        ? 'err'
-        : ''
+      : phase === 'idle'
+        ? ''
+        : 'live'
+
+  const youDisplay =
+    phase === 'listening' && !userText
+      ? 'LISTENING…'
+      : phase === 'transcribing' && !userText
+        ? 'TRANSCRIBING…'
+        : userText
 
   return jsxs('div', {
-    className: 'flex h-full flex-col gap-2.5 p-2.5 text-sm',
+    className: cn('flex flex-col gap-2 text-sm', compact ? 'p-2' : 'p-2.5 h-full'),
     children: [
       jsxs('div', {
         className: 'flex items-start justify-between gap-2',
@@ -699,127 +588,139 @@ function HudPane() {
           jsxs('div', {
             children: [
               jsx('div', {
-                className: 'text-[0.6875rem] font-semibold tracking-[0.16em] text-(--ui-text-secondary)',
+                className:
+                  'text-[0.6875rem] font-semibold tracking-[0.18em] text-(--ui-text-secondary)',
                 children: 'VOICE HUD'
               }),
               jsx('div', {
                 className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-                children: phase === 'idle' ? 'standby' : phase
+                children: native
+                  ? 'native voice · ' + phase
+                  : hudOn
+                    ? 'ready — start native voice'
+                    : 'standby'
               })
             ]
           }),
           jsx(Button, {
             size: 'sm',
             type: 'button',
-            variant: enabled ? 'destructive' : 'default',
+            variant: native ? 'destructive' : 'default',
             onClick: () => {
               haptic('tap')
               toggleHud()
             },
-            children: enabled ? 'Stop' : 'Listen'
+            children: native ? 'End' : 'Listen'
           })
         ]
       }),
 
       jsx(RecChrome, {}),
 
-      jsx(SpeechChip, {
-        label: 'YOU',
-        text:
-          phase === 'transcribing' && !userText
-            ? 'TRANSCRIBING…'
-            : phase === 'listening' && !userText
-              ? 'LISTENING…'
-              : userText,
-        tone: userTone
-      }),
-
       jsxs('div', {
-        className: cn(
-          'flex flex-col items-center justify-center rounded-md border p-2',
-          'border-[color-mix(in_oklab,var(--ui-accent)_28%,var(--ui-stroke-secondary))]',
-          'bg-[color-mix(in_oklab,var(--background)_65%,transparent)]'
-        ),
+        className: cn('grid gap-2', compact ? 'grid-cols-[1fr_auto]' : 'grid-cols-1'),
         children: [
-          jsx(FiberOrb, {}),
-          jsx('div', {
-            className: 'mt-1 text-[0.625rem] uppercase tracking-[0.12em] text-(--ui-text-quaternary)',
-            children: enabled ? 'mic open' : 'mic closed'
+          jsxs('div', {
+            className: 'flex min-w-0 flex-col gap-2',
+            children: [
+              jsx(SpeechChip, {
+                label: 'YOU',
+                text: youDisplay,
+                tone: userTone,
+                caps: true
+              }),
+              jsx(SpeechChip, {
+                label: 'AGENT',
+                text: agentText,
+                tone: agentText ? 'live' : '',
+                caps: false
+              })
+            ]
+          }),
+          jsxs('div', {
+            className: cn(
+              'flex flex-col items-center justify-center rounded-md border p-1.5',
+              'border-[color-mix(in_oklab,var(--ui-accent)_30%,var(--ui-stroke-secondary))]',
+              'bg-[color-mix(in_oklab,var(--background)_60%,transparent)]'
+            ),
+            children: [
+              jsx(FiberOrb, { size: compact ? 100 : 132 }),
+              jsx('div', {
+                className:
+                  'mt-0.5 text-[0.5625rem] uppercase tracking-[0.14em] text-(--ui-text-quaternary)',
+                children: phase
+              })
+            ]
           })
         ]
-      }),
-
-      jsx(SpeechChip, {
-        label: 'AGENT',
-        text: agentText,
-        tone: agentText ? 'live' : ''
       }),
 
       error
         ? jsx('div', {
-            className: 'rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive',
+            className:
+              'rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive',
             children: error
           })
         : null,
 
-      jsxs('div', {
-        className: 'mt-auto flex flex-wrap items-center gap-2 border-t border-(--ui-stroke-secondary) pt-2',
-        children: [
-          jsx(Toggle, {
-            label: 'Auto-send',
-            on: autoSubmit,
-            onClick: () => {
-              $autoSubmit.set(!$autoSubmit.get())
-              haptic('selection')
-            }
-          }),
-          jsx(Toggle, {
-            label: 'Continuous',
-            on: continuous,
-            onClick: () => {
-              $continuous.set(!$continuous.get())
-              haptic('selection')
-            }
-          })
-        ]
-      }),
-
       jsx('p', {
         className: 'text-[0.625rem] leading-relaxed text-(--ui-text-quaternary)',
-        children:
-          'Speak → pause ~1.4s → Hermes STT → active chat. Say “stop” alone to end. Uses Desktop /api/audio/transcribe + prompt.submit.'
+        children: compact
+          ? 'Skins Desktop native voice (same as the voice button / Ctrl+B). YOU = live caption · AGENT = reply stream · orb = mic/phase.'
+          : 'Deep-linked to the composer voice conversation — STT, barge-in, TTS, and stop-word stay core. This HUD is the Mark II glass layer on top.'
       })
     ]
   })
 }
 
-function Toggle({ label, on, onClick }) {
-  return jsx('button', {
-    type: 'button',
-    onClick,
+function ComposerHud() {
+  const hudOn = useValue($hudOn)
+  const native = useValue($nativeActive)
+  // Always reserve a slim strip when on or active so it feels attached to the dock
+  if (!hudOn && !native) return null
+  return jsx('div', {
     className: cn(
-      'rounded-full border px-2 py-0.5 text-[0.625rem] transition-colors',
-      on
-        ? 'border-[color-mix(in_oklab,var(--ui-accent)_50%,transparent)] text-foreground'
-        : 'border-(--ui-stroke-secondary) text-(--ui-text-tertiary)'
+      'mb-1 overflow-hidden rounded-xl border',
+      'border-[color-mix(in_oklab,var(--ui-accent)_28%,var(--ui-stroke-secondary))]',
+      'bg-[color-mix(in_oklab,var(--background)_78%,transparent)]',
+      'shadow-[0_8px_28px_color-mix(in_oklab,black_22%,transparent)]'
     ),
-    children: label + (on ? ' · on' : ' · off')
+    children: jsx(HudBody, { compact: true })
   })
 }
 
+function FloatingHud() {
+  const show = useValue($floating)
+  if (!show) {
+    return jsxs('div', {
+      className: 'flex h-full items-center justify-center p-3 text-sm text-(--ui-text-tertiary)',
+      children: [
+        'Floating HUD hidden · ',
+        jsx('button', {
+          type: 'button',
+          className: 'underline',
+          onClick: () => $floating.set(true),
+          children: 'show'
+        })
+      ]
+    })
+  }
+  return jsx(HudBody, { compact: false })
+}
+
 function StatusChip() {
-  const enabled = useValue($enabled)
+  const native = useValue($nativeActive)
   const phase = useValue($phase)
   const level = useValue($level)
-
-  const label = !enabled
+  const label = !native
     ? 'voice-hud'
     : phase === 'listening'
       ? `hud · ${Math.round(level * 100)}%`
       : `hud · ${phase}`
 
   return jsx(Tip, {
-    label: 'Voice HUD — Iron Man–style live STT chip + fiber orb. Click to toggle listening.',
+    label:
+      'Voice HUD — skins native Desktop voice conversation (composer). Click to start/end the same loop as the voice button.',
     children: jsx('button', {
       type: 'button',
       className: cn(
@@ -831,7 +732,7 @@ function StatusChip() {
         toggleHud()
       },
       children: jsx(Badge, {
-        variant: enabled ? (phase === 'error' ? 'destructive' : 'default') : 'muted',
+        variant: native ? 'default' : 'muted',
         children: label
       })
     })
@@ -840,34 +741,36 @@ function StatusChip() {
 
 export default {
   id: PLUGIN_ID,
-  name: 'Voice HUD (live speech)',
+  name: 'Voice HUD (native voice skin)',
   defaultEnabled: true,
   register(ctx) {
-    // Persist prefs
-    $autoSubmit.set(ctx.storage.get('autoSubmit', true))
-    $continuous.set(ctx.storage.get('continuous', true))
-    $hudVisible.set(ctx.storage.get('hudVisible', true))
-    $autoSubmit.listen(v => ctx.storage.set('autoSubmit', v))
-    $continuous.listen(v => ctx.storage.set('continuous', v))
-    $hudVisible.listen(v => ctx.storage.set('hudVisible', v))
+    $floating.set(ctx.storage.get('floating', true))
+    $hudOn.set(ctx.storage.get('hudOn', true))
+    $floating.listen(v => ctx.storage.set('floating', v))
+    $hudOn.listen(v => ctx.storage.set('hudOn', v))
 
-    const offEvents = wireGateway()
+    wireDomObserver()
+    const offGw = wireGateway()
 
     ctx.registerMany([
+      {
+        id: 'composer-hud',
+        area: COMPOSER_AREAS.top,
+        order: 10,
+        render: () => jsx(ComposerHud, {})
+      },
       {
         id: 'pane',
         area: 'panes',
         title: 'voice hud',
         data: {
-          // Floating card above the layout tree. uncloseable avoids the core
-          // "close pane → disable whole plugin" path (easy to trip on a HUD).
           placement: 'floating',
           anchor: 'top-right',
-          width: '300px',
-          height: '520px',
+          width: '320px',
+          height: '560px',
           uncloseable: true
         },
-        render: () => jsx(HudPane, {})
+        render: () => jsx(FloatingHud, {})
       },
       {
         id: 'chip',
@@ -881,8 +784,8 @@ export default {
         data: {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle listening',
-          keywords: ['voice', 'hud', 'jarvis', 'speech', 'stt', 'mic', 'listen'],
+          label: 'Voice HUD: Toggle native voice + HUD',
+          keywords: ['voice', 'hud', 'jarvis', 'speech', 'stt', 'mic', 'listen', 'conversation'],
           run: () => toggleHud()
         }
       },
@@ -891,9 +794,9 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'voice-hud.start',
-          label: 'Voice HUD: Start listening',
-          keywords: ['voice', 'start', 'listen'],
-          run: () => void startHud()
+          label: 'Voice HUD: Start native voice',
+          keywords: ['voice', 'start'],
+          run: () => startHudSession()
         }
       },
       {
@@ -901,9 +804,9 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'voice-hud.stop',
-          label: 'Voice HUD: Stop',
-          keywords: ['voice', 'stop'],
-          run: () => void stopHud({ notify: true })
+          label: 'Voice HUD: End native voice',
+          keywords: ['voice', 'stop', 'end'],
+          run: () => stopHudSession()
         }
       },
       {
@@ -911,7 +814,7 @@ export default {
         area: KEYBINDS_AREA,
         data: {
           id: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle listening',
+          label: 'Voice HUD: Toggle native voice + HUD',
           category: 'Voice HUD',
           defaults: ['mod+shift+v'],
           run: () => toggleHud()
@@ -919,12 +822,13 @@ export default {
       }
     ])
 
-    // Best-effort cleanup if the plugin host supports dispose hooks later.
     ctx.storage.set('_loadedAt', Date.now())
     if (typeof ctx.onUnload === 'function') {
       ctx.onUnload(() => {
-        offEvents()
-        void stopHud()
+        offGw()
+        stopDomObserver()
+        stopMeter()
+        stopSpeechSoft()
       })
     }
   }

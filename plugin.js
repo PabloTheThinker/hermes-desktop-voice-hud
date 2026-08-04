@@ -22,8 +22,6 @@ import {
   KEYBINDS_AREA,
   PALETTE_AREA,
   STATUSBAR_AREAS,
-  Separator,
-  StatusDot,
   Tip,
   atom,
   cn,
@@ -521,6 +519,20 @@ function phaseTone(phase) {
   return 'muted'
 }
 
+/** Inline pulse dot matching the core StatusDot color tokens (not a plugin-sdk export). */
+function PulseDot({ tone }) {
+  const cls =
+    tone === 'good'
+      ? 'bg-green-400 shadow-[0_0_6px_theme(colors.green.400)] animate-pulse-dot'
+      : tone === 'warn'
+        ? 'bg-amber-400 shadow-[0_0_6px_theme(colors.amber.400)]'
+        : 'bg-(--ui-text-tertiary)'
+  return jsx('span', {
+    'aria-hidden': true,
+    className: cn('h-2 w-2 shrink-0 rounded-full', cls)
+  })
+}
+
 function phaseLabel(phase) {
   if (phase === 'listening') return 'Listening'
   if (phase === 'transcribing') return 'Transcribing'
@@ -577,7 +589,7 @@ function ComposerIntegratedHud() {
       jsxs('div', {
         className: 'flex h-7 items-center gap-2',
         children: [
-          jsx(StatusDot, { tone: phaseTone(phase) }),
+          jsx(PulseDot, { tone: phaseTone(phase) }),
           jsx('span', {
             className: 'shrink-0 font-medium text-foreground/85',
             children: phaseLabel(phase)
@@ -684,7 +696,7 @@ function ComposerActionControl() {
         toggleVoice()
       },
       children: active
-        ? jsx(StatusDot, { tone: phaseTone(phase) })
+        ? jsx(PulseDot, { tone: phaseTone(phase) })
         : jsx(Codicon, { name: 'mic', size: '0.875rem' })
     })
   })

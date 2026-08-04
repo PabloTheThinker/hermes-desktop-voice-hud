@@ -8,24 +8,22 @@ Iron Man–inspired **live speech HUD** plugin for [Hermes Desktop](https://herm
 
 ## Features
 
-- **Floating HUD pane** (draggable floating card, top-right by default)
-- **Live YOU chip** — uppercase streaming caption while listening / after STT
-- **Fiber orb** — canvas viz driven by mic RMS
-- **REC + TCG** chrome during capture
-- **AGENT chip** — live assistant text from `message.delta`
-- **Hermes STT** via Desktop `POST /api/audio/transcribe` (same path as core voice)
-- **Auto-submit** final utterance with `prompt.submit` on the active session
-- **Continuous listen** — re-arms after silence / after the agent turn completes
-- **Stop word** — say `stop` alone to end the HUD
-- **Status bar chip** + **⌘/Ctrl+K** commands + **⌘/Ctrl+Shift+V** keybind
-- Optional browser **Web Speech API** for interim captions when the runtime supports it (Hermes STT remains source of truth for submit)
+- **Composer-mounted HUD** (`composer.top`) — sits above the typing / voice dock
+- **Native voice deep-link** — Listen toggles the same conversation as the core voice button (`hermes:composer-voice-toggle`)
+- **Floating card** (optional, uncloseable) for a larger workshop view
+- **YOU chip** — live caption (Web Speech interim when available + last user bubble)
+- **Fiber orb** — dense multicolor strand sphere (Mark II workshop language), driven by mic level / phase
+- **REC + TCG** chrome while the native loop is live
+- **AGENT chip** — streams gateway `message.delta`
+- **No second STT path** — core still owns silence end, Whisper, barge-in, TTS
+- **Status bar chip** + palette + **⌘/Ctrl+Shift+V**
 
 ## Requirements
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) with **Hermes Desktop**
 - Working mic permission in the Desktop app
 - STT configured (`stt.enabled`, local faster-whisper or a cloud provider) — same as core voice mode
-- An **active chat session** before listening (HUD submits into the focused chat)
+- An **active chat session** before starting native voice
 
 ## Install
 
@@ -62,8 +60,8 @@ cp plugin.js ~/.hermes/profiles/<name>/desktop-plugins/voice-hud/
 
 1. Open Hermes Desktop  
 2. **⌘/Ctrl+K → “Reload desktop plugins”** (or wait a few seconds for the watcher)  
-3. Confirm **Settings → Plugins → Voice HUD (live speech)** is enabled  
-4. Click the **voice-hud** status chip, press **⌘/Ctrl+Shift+V**, or run **Voice HUD: Start listening**
+3. Confirm **Settings → Plugins → Voice HUD (native voice skin)** is enabled  
+4. Click the **voice-hud** status chip, press **⌘/Ctrl+Shift+V**, hit **Listen**, or use the core voice button — same conversation loop
 
 ## Usage
 

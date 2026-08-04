@@ -3,7 +3,7 @@
  *
  * Contract (plugin system):
  *  - Only imports @hermes/plugin-sdk + react*
- *  - defaultEnabled: false → choice in Settings ▸ Plugins
+ *  - defaultEnabled: true → works after server sync; disable in Settings ▸ Plugins
  *  - Skins composer.top when native voice is live; mic control in composer.actions
  *  - Never owns STT/submit — only toggles core via hermes:composer-voice-toggle
  *    or the core End button
@@ -960,8 +960,8 @@ function WorkshopPane() {
 export default {
   id: PLUGIN_ID,
   name: 'Voice HUD',
-  /** Choice: off until enabled in Settings ▸ Plugins. */
-  defaultEnabled: false,
+  /** On by default once installed/synced; disable anytime in Settings ▸ Plugins. */
+  defaultEnabled: true,
   register(ctx) {
     $workshop.set(ctx.storage.get('workshop', false))
     $suppressStockPill.set(ctx.storage.get('suppressStockPill', true))

@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
-# Install Voice HUD into the active Hermes desktop-plugins directory.
-# Works from a git clone OR as: curl -fsSL …/install.sh | bash
+# Install Voice HUD into a Hermes desktop-plugins directory.
+#
+# Preferred (remote Desktop): install ONCE on the backend host. Hermes Desktop
+# auto-syncs `$remote_hermes_home/desktop-plugins/*` into the local Electron
+# plugin door when it connects — no per-laptop install needed.
+#
+#   # on the server (parallax / hermes serve host), as the hermes user:
+#   HERMES_HOME=/home/ilo/.hermes ./install.sh
+#
+# Laptop-only (local Desktop, no remote):
+#   ./install.sh
+#   # or: curl -fsSL …/install.sh | bash
+#
 set -euo pipefail
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -9,13 +20,8 @@ REPO_RAW="${VOICE_HUD_RAW:-https://raw.githubusercontent.com/PabloTheThinker/her
 
 mkdir -p "$TARGET"
 
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" && -f "$(dirname "${BASH_SOURCE[0]}")/plugin.js" ]]; then
   SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-else
-  SRC_DIR=""
-fi
-
-if [[ -n "$SRC_DIR" && -f "$SRC_DIR/plugin.js" ]]; then
   cp -f "$SRC_DIR/plugin.js" "$TARGET/plugin.js"
   cp -f "$SRC_DIR/README.md" "$TARGET/README.md" 2>/dev/null || true
   echo "Installed from local clone → $TARGET/plugin.js"
@@ -26,5 +32,10 @@ else
   echo "Installed from GitHub → $TARGET/plugin.js"
 fi
 
-echo "In Hermes Desktop: ⌘/Ctrl+K → Reload desktop plugins"
-echo "Then click the voice-hud status chip or run: Voice HUD: Start listening"
+echo
+echo "Where did you install?"
+echo "  • Backend host (remote Desktop mode): reopen Hermes Desktop on any laptop"
+echo "    connected to this server — plugins auto-sync from this directory."
+echo "  • Laptop only: ⌘/Ctrl+K → Reload desktop plugins"
+echo "Then: open a chat → use the Voice HUD mic in the composer (or Mod+Shift+V)."
+echo "Disable anytime: Settings → Plugins → Voice HUD."

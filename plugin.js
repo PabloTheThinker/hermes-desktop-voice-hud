@@ -25,7 +25,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 import { useEffect, useRef } from 'react'
-import { jsx, jsxs, Fragment } from 'react/jsx-runtime'
+import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'voice-hud'
 

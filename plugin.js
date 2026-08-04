@@ -1,18 +1,17 @@
 /**
- * voice-hud — native-integrated speech layer for Hermes Desktop.
+ * voice-hud — optional skin over Hermes Desktop *native* voice conversation.
  *
- * Design goals (Pablo):
- *  1. Deep-link the *core* composer voice conversation (not a second STT path).
- *  2. Feel like one surface with the typing dock — Hermes tokens, flat chrome.
- *  3. Mark II workshop orb + YOU caption (film still), without a separate “app”.
- *
- * Surfaces:
- *   composer.top     — primary HUD (expands only while voice is live)
- *   composer.actions — quiet Listen control next to model / send
- *   statusBar chip   — phase glance
- *   floating pane    — optional workshop view (OFF by default)
+ * Contract (plugin system):
+ *  - Only imports @hermes/plugin-sdk + react*
+ *  - defaultEnabled: false → choice in Settings ▸ Plugins
+ *  - Skins composer.top when native voice is live; mic control in composer.actions
+ *  - Never owns STT/submit — only toggles core via hermes:composer-voice-toggle
+ *    or the core End button
+ *  - When conversation ends (End / stop-word / core stop), ALL local capture
+ *    (analyser, Web Speech) stops hard and does not restart
  *
  * Install: $HERMES_HOME/desktop-plugins/voice-hud/plugin.js
+ * Activate: Settings ▸ Plugins ▸ Voice HUD ON → Reload desktop plugins
  */
 import {
   Badge,
@@ -34,7 +33,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'voice-hud'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
-const STYLE_ID = 'voice-hud-integrated-css'
+const STYLE_ID = 'voice-hud-css'
 
 /** @typedef {'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'} Phase */
 
@@ -45,10 +44,18 @@ const $userText = atom('')
 const $agentText = atom('')
 const $elapsed = atom(0)
 const $error = atom('')
-/** Workshop floating card — off by default so the composer path is “the” UI. */
+/** Optional floating workshop — off by default. */
 const $workshop = atom(false)
-/** When live, soften/hide the stock 32px voice-activity pill so we don’t double chrome. */
+/** Hide stock voice pill while our strip is live (one chrome). */
 const $suppressStockPill = atom(true)
+
+/**
+ * Capture gate — when false, Web Speech onend MUST NOT restart and meter
+ * must stay down. This is the fix for “stopped speaking but still listening”.
+ */
+let captureWanted = false
+/** True only after *we* successfully asked core to start (or mirrored start). */
+let sessionWanted = false
 
 const meter = {
   stream: null,
@@ -58,7 +65,8 @@ const meter = {
   timer: 0,
   startedAt: 0,
   speechRec: null,
-  poll: 0
+  poll: 0,
+  endWatch: 0
 }
 
 function formatTcg(ms) {
@@ -75,9 +83,13 @@ function formatElapsed(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
-function toggleNativeVoice() {
+// --- Core voice bus ----------------------------------------------------------
+
+function dispatchVoiceToggle() {
   try {
-    window.dispatchEvent(new CustomEvent(VOICE_TOGGLE_EVENT, { detail: { target: 'main' } }))
+    window.dispatchEvent(
+      new CustomEvent(VOICE_TOGGLE_EVENT, { detail: { target: 'main' } })
+    )
     return true
   } catch (err) {
     $error.set(err instanceof Error ? err.message : String(err))
@@ -85,63 +97,150 @@ function toggleNativeVoice() {
   }
 }
 
-function startVoice() {
-  $error.set('')
-  if (!$nativeActive.get()) {
-    haptic('open')
-    toggleNativeVoice()
+/** Prefer clicking the live End control — calls endConversation() directly. */
+function clickCoreEnd() {
+  if (typeof document === 'undefined') return false
+  const btn =
+    document.querySelector(
+      '[data-slot="composer-root"] button[aria-label*="End" i], [data-slot="composer-dock"] button[aria-label*="End" i]'
+    ) ||
+    document.querySelector(
+      'button[aria-label*="End conversation" i], button[aria-label*="End voice" i]'
+    )
+  if (btn && typeof btn.click === 'function') {
+    btn.click()
+    return true
+  }
+  return false
+}
+
+function clickCoreStart() {
+  if (typeof document === 'undefined') return false
+  const btn =
+    document.querySelector(
+      '[data-slot="composer-root"] button[aria-label*="Start voice" i], [data-slot="composer-dock"] button[aria-label*="Start voice" i]'
+    ) ||
+    document.querySelector(
+      'button[aria-label*="voice conversation" i]:not([aria-pressed="true"])'
+    )
+  if (btn && typeof btn.click === 'function') {
+    btn.click()
+    return true
+  }
+  return false
+}
+
+// --- HARD STOP — no restart --------------------------------------------------
+
+function stopSpeechSoft() {
+  const rec = meter.speechRec
+  meter.speechRec = null
+  if (!rec) return
+  try {
+    rec.onresult = null
+    rec.onerror = null
+    rec.onend = null // critical: block auto-restart
+    rec.abort?.()
+    rec.stop?.()
+  } catch {
+    /* ignore */
   }
 }
 
+function stopMeter() {
+  if (meter.raf) {
+    cancelAnimationFrame(meter.raf)
+    meter.raf = 0
+  }
+  if (meter.timer) {
+    clearInterval(meter.timer)
+    meter.timer = 0
+  }
+  try {
+    meter.ctx?.close()
+  } catch {
+    /* ignore */
+  }
+  meter.ctx = null
+  meter.analyser = null
+  if (meter.stream) {
+    try {
+      meter.stream.getTracks().forEach(t => {
+        try {
+          t.stop()
+        } catch {
+          /* ignore */
+        }
+      })
+    } catch {
+      /* ignore */
+    }
+  }
+  meter.stream = null
+  $level.set(0)
+}
+
+/** Full local teardown. Safe to call repeatedly. Does not touch core voice. */
+function stopAllCapture(reason) {
+  captureWanted = false
+  stopSpeechSoft()
+  stopMeter()
+  $level.set(0)
+  if (reason) {
+    // keep last texts for a beat; phase goes idle
+  }
+  $phase.set('idle')
+  $elapsed.set(0)
+  setLiveAttr(false)
+}
+
+/** End native conversation + local capture. Idempotent. */
 function endVoice() {
-  if ($nativeActive.get()) {
-    haptic('close')
-    toggleNativeVoice()
+  haptic('close')
+  sessionWanted = false
+  stopAllCapture('end')
+  $error.set('')
+
+  // Prefer End button (always ends) over toggle (could desync and start).
+  const clicked = clickCoreEnd()
+  if (!clicked && $nativeActive.get()) {
+    dispatchVoiceToggle()
+  }
+
+  // If DOM still shows active shortly after, force toggle once more.
+  if (meter.endWatch) clearTimeout(meter.endWatch)
+  meter.endWatch = window.setTimeout(() => {
+    meter.endWatch = 0
+    const still = detectNative().active
+    if (still) {
+      if (!clickCoreEnd()) dispatchVoiceToggle()
+    }
+    stopAllCapture('end-watch')
+    $nativeActive.set(false)
+    $phase.set('idle')
+  }, 350)
+}
+
+function startVoice() {
+  $error.set('')
+  if ($nativeActive.get()) return
+  haptic('open')
+  sessionWanted = true
+  // Start core first; capture arms only after we observe active.
+  if (!clickCoreStart()) {
+    dispatchVoiceToggle()
   }
 }
 
 function toggleVoice() {
-  if ($nativeActive.get()) endVoice()
+  if ($nativeActive.get() || sessionWanted) endVoice()
   else startVoice()
 }
 
-// --- Integrated CSS: match composer chrome, hide stock pill when we own the strip ---
-function ensureIntegratedCss() {
-  if (typeof document === 'undefined') return
-  let el = document.getElementById(STYLE_ID)
-  if (!el) {
-    el = document.createElement('style')
-    el.id = STYLE_ID
-    document.head.appendChild(el)
-  }
-  // Stock VoiceActivity is the h-8 strip with aria-live polite above the input.
-  // When our HUD is live we collapse it so the dock reads as one layer.
-  el.textContent = $suppressStockPill.get()
-    ? `
-/* voice-hud: one chrome with the composer while native voice is live */
-[data-voice-hud-live="1"] [data-slot="composer-root"] > div > div > [aria-live="polite"][role="status"].flex.h-8,
-[data-voice-hud-live="1"] [data-slot="composer-surface"] [aria-live="polite"][role="status"].h-8 {
-  display: none !important;
-}
-`
-    : ''
-}
+// --- Soft captions (never owns submit; killed on stop) -----------------------
 
-function setLiveAttr(on) {
-  if (typeof document === 'undefined') return
-  const roots = document.querySelectorAll('[data-slot="composer-root"], [data-slot="composer-dock"]')
-  roots.forEach(n => {
-    if (on) n.setAttribute('data-voice-hud-live', '1')
-    else n.removeAttribute('data-voice-hud-live')
-  })
-  // also mark body for any portal’d bits
-  if (on) document.documentElement.setAttribute('data-voice-hud-live', '1')
-  else document.documentElement.removeAttribute('data-voice-hud-live')
-  ensureIntegratedCss()
-}
-
-// --- Soft interim captions (core still submits) ---
 function startSpeechSoft() {
+  if (!captureWanted) return
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition
   if (!SR || meter.speechRec) return
   try {
@@ -150,6 +249,7 @@ function startSpeechSoft() {
     rec.interimResults = true
     rec.lang = navigator.language || 'en-US'
     rec.onresult = event => {
+      if (!captureWanted) return
       let interim = ''
       let final = ''
       for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -161,9 +261,17 @@ function startSpeechSoft() {
       const text = (final || interim).trim()
       if (text) $userText.set(text)
     }
-    rec.onerror = () => {}
+    rec.onerror = () => {
+      /* swallow — core STT is source of truth */
+    }
     rec.onend = () => {
-      if (meter.speechRec === rec && $nativeActive.get() && $phase.get() === 'listening') {
+      // ONLY restart if capture still wanted AND native still live
+      if (
+        meter.speechRec === rec &&
+        captureWanted &&
+        $nativeActive.get() &&
+        $phase.get() === 'listening'
+      ) {
         try {
           rec.start()
         } catch {
@@ -174,20 +282,8 @@ function startSpeechSoft() {
     rec.start()
     meter.speechRec = rec
   } catch {
-    /* no Web Speech in this Electron — OK */
+    /* Electron often lacks Web Speech */
   }
-}
-
-function stopSpeechSoft() {
-  if (!meter.speechRec) return
-  try {
-    meter.speechRec.onresult = null
-    meter.speechRec.onend = null
-    meter.speechRec.stop()
-  } catch {
-    /* ignore */
-  }
-  meter.speechRec = null
 }
 
 function rmsFromTimeDomain(data) {
@@ -199,15 +295,32 @@ function rmsFromTimeDomain(data) {
   return Math.sqrt(sum / Math.max(1, data.length))
 }
 
+/**
+ * Optional level meter. May fail if core holds the mic exclusively — fine.
+ * Never blocks stop; tracks always torn down in stopMeter.
+ */
 async function startMeter() {
-  if (meter.analyser || !navigator.mediaDevices?.getUserMedia) return
+  if (!captureWanted || meter.analyser) return
+  if (!navigator.mediaDevices?.getUserMedia) return
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
     })
+    // Race: conversation may have ended while permission dialog was open
+    if (!captureWanted) {
+      stream.getTracks().forEach(t => t.stop())
+      return
+    }
     meter.stream = stream
     const AC = window.AudioContext || window.webkitAudioContext
-    if (!AC) return
+    if (!AC) {
+      stream.getTracks().forEach(t => t.stop())
+      return
+    }
     const ctx = new AC()
     const source = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
@@ -219,32 +332,15 @@ async function startMeter() {
     void ctx.resume()
     const data = new Uint8Array(analyser.fftSize)
     const tick = () => {
-      if (!meter.analyser) return
+      if (!meter.analyser || !captureWanted) return
       meter.analyser.getByteTimeDomainData(data)
       $level.set(Math.min(1, rmsFromTimeDomain(data) * 7.5))
       meter.raf = requestAnimationFrame(tick)
     }
     meter.raf = requestAnimationFrame(tick)
   } catch {
-    /* mic held exclusively by core — phase-driven orb still works */
+    /* core holds mic — phase-driven orb only */
   }
-}
-
-function stopMeter() {
-  if (meter.raf) cancelAnimationFrame(meter.raf)
-  meter.raf = 0
-  if (meter.timer) clearInterval(meter.timer)
-  meter.timer = 0
-  try {
-    meter.ctx?.close()
-  } catch {
-    /* ignore */
-  }
-  meter.ctx = null
-  meter.analyser = null
-  meter.stream?.getTracks().forEach(t => t.stop())
-  meter.stream = null
-  $level.set(0)
 }
 
 function startElapsed() {
@@ -252,24 +348,48 @@ function startElapsed() {
   $elapsed.set(0)
   if (meter.timer) clearInterval(meter.timer)
   meter.timer = window.setInterval(() => {
+    if (!captureWanted) {
+      clearInterval(meter.timer)
+      meter.timer = 0
+      return
+    }
     $elapsed.set(performance.now() - meter.startedAt)
   }, 100)
 }
 
-function detectNativePhase() {
+function armCapture() {
+  if (captureWanted) return
+  captureWanted = true
+  $userText.set('')
+  $agentText.set('')
+  startElapsed()
+  void startMeter()
+  startSpeechSoft()
+}
+
+// --- DOM observe native conversation ----------------------------------------
+
+function detectNative() {
+  if (typeof document === 'undefined') {
+    return { active: false, phase: /** @type {Phase} */ ('idle') }
+  }
+
+  let hit = ''
   const scopes = document.querySelectorAll(
     '[data-slot="composer-root"], [data-slot="composer-dock"], [data-slot="composer-surface"]'
   )
-  let hit = ''
   for (const scope of scopes) {
     for (const el of scope.querySelectorAll('[role="status"]')) {
+      // Skip our own HUD status
+      if (el.getAttribute('data-voice-hud') === '1') continue
       const t = (el.textContent || '').trim().toLowerCase()
       if (!t) continue
       if (t.includes('listen')) hit = 'listening'
       else if (t.includes('transcrib') || t.includes('dictat')) hit = 'transcribing'
       else if (t.includes('think')) hit = 'thinking'
-      else if (t.includes('speak') || t.includes('reading') || t.includes('preparing')) hit = 'speaking'
-      else if (t.includes('mut')) hit = 'listening'
+      else if (t.includes('speak') || t.includes('reading') || t.includes('preparing')) {
+        hit = 'speaking'
+      } else if (t.includes('mut')) hit = 'listening'
       if (hit) break
     }
     if (hit) break
@@ -278,10 +398,12 @@ function detectNativePhase() {
   const endBtn = document.querySelector(
     '[data-slot="composer-root"] button[aria-label*="End" i], [data-slot="composer-dock"] button[aria-label*="End" i]'
   )
-  const active = Boolean(endBtn) || Boolean(hit)
+  // ConversationPill only mounts while voiceConversationActive
+  const active = Boolean(endBtn) || Boolean(hit && hit !== 'idle')
 
   if (!hit && active) {
     for (const el of document.querySelectorAll('[aria-live="polite"]')) {
+      if (el.getAttribute('data-voice-hud') === '1') continue
       const t = (el.textContent || '').toLowerCase()
       if (t.includes('dictat') || t.includes('recording')) {
         hit = 'listening'
@@ -298,7 +420,10 @@ function detectNativePhase() {
     }
   }
 
-  return { active, phase: /** @type {Phase} */ (active ? hit || 'listening' : 'idle') }
+  return {
+    active,
+    phase: /** @type {Phase} */ (active ? hit || 'listening' : 'idle')
+  }
 }
 
 function scrapeLastUserBubble() {
@@ -309,46 +434,107 @@ function scrapeLastUserBubble() {
   return (nodes[nodes.length - 1].textContent || '').trim().slice(0, 420)
 }
 
+function onNativeBecameActive() {
+  sessionWanted = true
+  armCapture()
+  setLiveAttr(true)
+}
+
+function onNativeBecameInactive() {
+  sessionWanted = false
+  stopAllCapture('native-off')
+  $nativeActive.set(false)
+  $phase.set('idle')
+}
+
 function wireDomObserver() {
   if (meter.poll) return
   meter.poll = window.setInterval(() => {
-    const { active, phase } = detectNativePhase()
+    const { active, phase } = detectNative()
     const was = $nativeActive.get()
-    $nativeActive.set(active)
-    setLiveAttr(active)
 
-    if (active && !was) {
-      $userText.set('')
-      $agentText.set('')
-      startElapsed()
-      startMeter()
-      startSpeechSoft()
-    } else if (!active && was) {
-      stopMeter()
-      stopSpeechSoft()
-      $phase.set('idle')
-      $elapsed.set(0)
+    if (active !== was) {
+      $nativeActive.set(active)
+      if (active) onNativeBecameActive()
+      else onNativeBecameInactive()
+    } else {
+      $nativeActive.set(active)
     }
 
     if (active) {
       $phase.set(phase)
+      setLiveAttr(true)
+      // If capture was killed somehow while still active, re-arm once
+      if (!captureWanted && sessionWanted) armCapture()
       if (phase === 'thinking' || phase === 'speaking' || phase === 'transcribing') {
         const bubble = scrapeLastUserBubble()
-        if (bubble && bubble.length >= ($userText.get() || '').length) $userText.set(bubble)
+        if (bubble && bubble.length >= ($userText.get() || '').length) {
+          $userText.set(bubble)
+        }
       }
+      // While agent speaks, pause soft-speech restart noise (still ok to keep)
+      if (phase === 'speaking' || phase === 'thinking') {
+        // keep captureWanted true for session, but don't force speech rec
+      }
+    } else if (captureWanted || sessionWanted) {
+      // belt-and-suspenders: inactive must kill listening
+      onNativeBecameInactive()
     }
-  }, 180)
+  }, 160)
 }
 
 function stopDomObserver() {
-  if (meter.poll) clearInterval(meter.poll)
-  meter.poll = 0
+  if (meter.poll) {
+    clearInterval(meter.poll)
+    meter.poll = 0
+  }
+  if (meter.endWatch) {
+    clearTimeout(meter.endWatch)
+    meter.endWatch = 0
+  }
   setLiveAttr(false)
 }
+
+// --- CSS: one chrome with composer ------------------------------------------
+
+function ensureIntegratedCss() {
+  if (typeof document === 'undefined') return
+  let el = document.getElementById(STYLE_ID)
+  if (!el) {
+    el = document.createElement('style')
+    el.id = STYLE_ID
+    document.head.appendChild(el)
+  }
+  el.textContent = $suppressStockPill.get()
+    ? `
+/* voice-hud: collapse stock VoiceActivity pill while our strip owns the dock */
+[data-voice-hud-live="1"] [data-slot="composer-root"] [aria-live="polite"][role="status"].h-8:not([data-voice-hud]),
+[data-voice-hud-live="1"] [data-slot="composer-surface"] [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
+  display: none !important;
+}
+`
+    : ''
+}
+
+function setLiveAttr(on) {
+  if (typeof document === 'undefined') return
+  document
+    .querySelectorAll('[data-slot="composer-root"], [data-slot="composer-dock"]')
+    .forEach(n => {
+      if (on) n.setAttribute('data-voice-hud-live', '1')
+      else n.removeAttribute('data-voice-hud-live')
+    })
+  if (on) document.documentElement.setAttribute('data-voice-hud-live', '1')
+  else document.documentElement.removeAttribute('data-voice-hud-live')
+  ensureIntegratedCss()
+}
+
+// --- Gateway agent chip ------------------------------------------------------
 
 function wireGateway() {
   return host.onEvent('*', event => {
     if (!event || typeof event !== 'object') return
+    if (!$nativeActive.get() && !sessionWanted) return
     const type = event.type
     const payload = event.payload && typeof event.payload === 'object' ? event.payload : {}
     const sid = event.session_id || payload.session_id
@@ -365,15 +551,14 @@ function wireGateway() {
         if ($nativeActive.get()) $phase.set('speaking')
       }
     } else if (type === 'message.complete') {
+      // Core returns to listening for the next turn — we stay armed until End
       if ($nativeActive.get()) $phase.set('listening')
     }
   })
 }
 
-/**
- * Film still orb: dense toroidal fiber ball.
- * Blue/cyan core → green equator → yellow/magenta rim. Nested in CAD tile chrome.
- */
+// --- Fiber orb ---------------------------------------------------------------
+
 function FiberOrb({ size = 88 }) {
   const ref = useRef(null)
   const level = useValue($level)
@@ -398,7 +583,7 @@ function FiberOrb({ size = 88 }) {
     canvas.style.height = `${S}px`
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-    const STRANDS = 140
+    const STRANDS = 120
     const draw = now => {
       const t = (now - t0) / 1000
       const cx = S / 2
@@ -406,12 +591,11 @@ function FiberOrb({ size = 88 }) {
       const ph = phaseRef.current
       const lv = levelRef.current
       const live = ph === 'listening' || ph === 'speaking' || ph === 'transcribing'
-      const base = ph === 'speaking' ? 0.5 : ph === 'listening' ? 0.38 : ph === 'thinking' ? 0.26 : 0.12
+      const base =
+        ph === 'speaking' ? 0.5 : ph === 'listening' ? 0.38 : ph === 'thinking' ? 0.26 : 0.1
       const amp = base + lv * (ph === 'speaking' ? 0.5 : 0.95)
 
       ctx.clearRect(0, 0, S, S)
-
-      // CAD tile fill (film: dark navy well)
       ctx.fillStyle = 'hsla(210, 55%, 8%, 0.92)'
       ctx.beginPath()
       roundRect(ctx, 0.5, 0.5, S - 1, S - 1, 4)
@@ -420,7 +604,6 @@ function FiberOrb({ size = 88 }) {
       ctx.lineWidth = 1
       ctx.stroke()
 
-      // Soft core glow — blue center like the still
       const core = ctx.createRadialGradient(cx, cy, 1, cx, cy, S * 0.42)
       core.addColorStop(0, `hsla(205, 100%, 55%, ${0.55 + amp * 0.25})`)
       core.addColorStop(0.25, `hsla(185, 95%, 50%, ${0.35 + amp * 0.2})`)
@@ -432,15 +615,12 @@ function FiberOrb({ size = 88 }) {
       ctx.arc(cx, cy, S * 0.42, 0, Math.PI * 2)
       ctx.fill()
 
-      // Dense tangled fibers (film: high density, short arcs around a ring)
       for (let i = 0; i < STRANDS; i++) {
-        // hue walk: blue → cyan → green → yellow → magenta around the torus
         const hue = 190 + (i / STRANDS) * 170 + t * 40
         const a0 = (i / STRANDS) * Math.PI * 2 + t * (0.5 + (i % 5) * 0.03)
-        // ring radius — toroidal, not filled ball
         const ring = S * (0.16 + (i % 9) * 0.008)
         ctx.beginPath()
-        const segs = 28
+        const segs = 26
         for (let s = 0; s <= segs; s++) {
           const u = s / segs
           const wobble = Math.sin(t * 3.2 + i * 0.4 + u * 10) * S * 0.028 * amp
@@ -458,18 +638,11 @@ function FiberOrb({ size = 88 }) {
         ctx.stroke()
       }
 
-      // Hollow bright ring (still has clear donut hole edge)
       ctx.beginPath()
       ctx.arc(cx, cy, S * (0.14 + amp * 0.04), 0, Math.PI * 2)
       ctx.strokeStyle = `hsla(195, 100%, 70%, ${0.35 + amp * 0.4})`
       ctx.lineWidth = 1.4
       ctx.stroke()
-
-      // Tiny CAD chrome dots (film window has micro chrome)
-      ctx.fillStyle = 'hsla(200, 30%, 70%, 0.35)'
-      ctx.beginPath()
-      ctx.arc(S - 7, 6, 1.2, 0, Math.PI * 2)
-      ctx.fill()
 
       raf = requestAnimationFrame(draw)
     }
@@ -504,7 +677,9 @@ function LevelBars({ level, active }) {
             'w-0.5 rounded-full bg-current transition-[height,opacity] duration-100',
             active ? 'opacity-80' : 'opacity-40'
           ),
-          style: { height: `${(active ? 0.28 + Math.min(0.72, n * w) : 0.28) * 100}%` }
+          style: {
+            height: `${(active ? 0.28 + Math.min(0.72, n * w) : 0.28) * 100}%`
+          }
         },
         i
       )
@@ -512,23 +687,15 @@ function LevelBars({ level, active }) {
   })
 }
 
-function phaseTone(phase) {
-  if (phase === 'speaking') return 'good'
-  if (phase === 'listening' || phase === 'transcribing') return 'good'
-  if (phase === 'thinking') return 'warn'
-  return 'muted'
-}
-
-function PulseDot({ tone }) {
-  const cls =
-    tone === 'good'
-      ? 'bg-green-400 shadow-[0_0_6px_theme(colors.green.400)] animate-pulse'
-      : tone === 'warn'
-        ? 'bg-amber-400 shadow-[0_0_6px_theme(colors.amber.400)] animate-pulse'
-        : 'bg-(--ui-text-tertiary) opacity-60'
+function PulseDot({ live }) {
   return jsx('span', {
     'aria-hidden': true,
-    className: cn('h-2 w-2 shrink-0 rounded-full', cls)
+    className: cn(
+      'h-2 w-2 shrink-0 rounded-full',
+      live
+        ? 'animate-pulse bg-green-400 shadow-[0_0_6px_theme(colors.green.400)]'
+        : 'bg-(--ui-text-tertiary) opacity-50'
+    )
   })
 }
 
@@ -540,11 +707,8 @@ function phaseLabel(phase) {
   return 'Voice'
 }
 
-/**
- * Primary HUD — same visual family as core VoiceActivity (h-8 strip language),
- * expanded into a single flat dock row: status · YOU caption · orb · AGENT.
- * No nested cards. Tokens only.
- */
+// --- UI ----------------------------------------------------------------------
+
 function ComposerIntegratedHud() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
@@ -554,7 +718,6 @@ function ComposerIntegratedHud() {
   const elapsed = useValue($elapsed)
   const error = useValue($error)
 
-  // Idle: render nothing — the actions control is the quiet affordance.
   if (!active) {
     if (error) {
       return jsx('div', {
@@ -575,7 +738,6 @@ function ComposerIntegratedHud() {
 
   return jsxs('div', {
     className: cn(
-      // Match VoiceActivity / VoicePlaybackActivity primitives exactly
       'mb-1 flex flex-col gap-1.5 rounded-xl border px-2.5 py-2 text-xs',
       'border-border/55 bg-muted/55 text-muted-foreground',
       'shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] backdrop-blur-sm',
@@ -583,12 +745,12 @@ function ComposerIntegratedHud() {
     ),
     'aria-live': 'polite',
     role: 'status',
+    'data-voice-hud': '1',
     children: [
-      // Row 1 — same height language as stock pill
       jsxs('div', {
         className: 'flex h-7 items-center gap-2',
         children: [
-          jsx(PulseDot, { tone: phaseTone(phase) }),
+          jsx(PulseDot, { live: phase === 'listening' || phase === 'speaking' }),
           jsx('span', {
             className: 'shrink-0 font-medium text-foreground/85',
             children: phaseLabel(phase)
@@ -597,9 +759,13 @@ function ComposerIntegratedHud() {
             className: 'font-mono text-[0.6875rem] text-muted-foreground/85',
             children: formatElapsed(elapsed / 1000)
           }),
-          jsx(LevelBars, { level, active: phase === 'listening' || phase === 'speaking' }),
+          jsx(LevelBars, {
+            level,
+            active: phase === 'listening' || phase === 'speaking'
+          }),
           jsx('span', {
-            className: 'ml-auto font-mono text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
+            className:
+              'ml-auto font-mono text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
             children: 'TCG ' + formatTcg(elapsed)
           }),
           jsx(Button, {
@@ -607,23 +773,17 @@ function ComposerIntegratedHud() {
             type: 'button',
             variant: 'ghost',
             className: 'h-6 shrink-0 rounded-full px-2 text-[0.6875rem]',
-            onClick: () => {
-              haptic('close')
-              endVoice()
-            },
+            onClick: () => endVoice(),
             children: 'End'
           })
         ]
       }),
-
-      // Row 2 — film layout: caption chip + orb tile (flat, one hairline)
       jsxs('div', {
         className: 'flex items-stretch gap-2',
         children: [
           jsxs('div', {
             className: 'flex min-w-0 flex-1 flex-col gap-1.5',
             children: [
-              // YOU — film STT chip
               jsxs('div', {
                 className: cn(
                   'min-h-[2rem] rounded-lg border px-2.5 py-1.5',
@@ -645,7 +805,6 @@ function ComposerIntegratedHud() {
                   })
                 ]
               }),
-              // AGENT — only when there is stream text (keeps flat when idle listen)
               agentText
                 ? jsxs('div', {
                     className: cn(
@@ -659,7 +818,8 @@ function ComposerIntegratedHud() {
                         children: 'Hermes'
                       }),
                       jsx('div', {
-                        className: 'line-clamp-2 text-[0.75rem] leading-snug text-foreground/90',
+                        className:
+                          'line-clamp-2 text-[0.75rem] leading-snug text-foreground/90',
                         title: agentText,
                         children: agentText
                       })
@@ -668,7 +828,6 @@ function ComposerIntegratedHud() {
                 : null
             ]
           }),
-          // Orb CAD tile — film proportions (smaller than caption width)
           jsx(FiberOrb, { size: 88 })
         ]
       })
@@ -676,14 +835,13 @@ function ComposerIntegratedHud() {
   })
 }
 
-/** Quiet control in the composer action row — sits with send / model. */
 function ComposerActionControl() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
   return jsx(Tip, {
     label: active
-      ? 'End voice conversation (native Desktop voice)'
-      : 'Start voice conversation — Voice HUD skins the native loop',
+      ? 'End native voice conversation (stops listening)'
+      : 'Start native voice conversation — HUD skins the Desktop loop',
     children: jsx(Button, {
       type: 'button',
       size: 'icon-sm',
@@ -695,7 +853,7 @@ function ComposerActionControl() {
         toggleVoice()
       },
       children: active
-        ? jsx(PulseDot, { tone: phaseTone(phase) })
+        ? jsx(PulseDot, { live: phase === 'listening' || phase === 'speaking' })
         : jsx(Codicon, { name: 'mic', size: '0.875rem' })
     })
   })
@@ -706,13 +864,14 @@ function StatusChip() {
   const phase = useValue($phase)
   const level = useValue($level)
   const label = !active
-    ? 'voice'
+    ? 'voice hud'
     : phase === 'listening'
-      ? `voice · ${Math.round(level * 100)}%`
-      : `voice · ${phase}`
+      ? `hud · ${Math.round(level * 100)}%`
+      : `hud · ${phase}`
 
   return jsx(Tip, {
-    label: 'Native voice + integrated HUD (composer). Click to toggle.',
+    label:
+      'Voice HUD (optional). Skins Desktop native voice. Click to start/end. Disable anytime in Settings → Plugins.',
     children: jsx('button', {
       type: 'button',
       className: cn(
@@ -723,23 +882,26 @@ function StatusChip() {
         haptic('tap')
         toggleVoice()
       },
-      children: jsx(Badge, { variant: active ? 'default' : 'muted', children: label })
+      children: jsx(Badge, {
+        variant: active ? 'default' : 'muted',
+        children: label
+      })
     })
   })
 }
 
-/** Optional workshop floating — deliberately secondary. */
 function WorkshopPane() {
   const on = useValue($workshop)
   const active = useValue($nativeActive)
   if (!on) {
     return jsxs('div', {
-      className: 'flex h-full flex-col items-center justify-center gap-3 p-4 text-center text-sm',
+      className:
+        'flex h-full flex-col items-center justify-center gap-3 p-4 text-center text-sm',
       children: [
         jsx('p', {
           className: 'max-w-[14rem] text-(--ui-text-tertiary)',
           children:
-            'Workshop view is optional. The main HUD lives in the composer — same chrome as Desktop voice.'
+            'Optional workshop canvas. Main HUD lives in the composer with native Desktop voice.'
         }),
         jsx(Button, {
           type: 'button',
@@ -779,11 +941,17 @@ function WorkshopPane() {
             onClick: () => startVoice(),
             children: 'Start native voice'
           })
-        : null,
+        : jsx(Button, {
+            type: 'button',
+            className: 'mt-auto',
+            variant: 'destructive',
+            onClick: () => endVoice(),
+            children: 'End voice (stop listening)'
+          }),
       jsx('p', {
         className: 'text-[0.625rem] leading-relaxed text-(--ui-text-quaternary)',
         children:
-          'Same native conversation as the composer button. This pane is only a larger canvas — not a second voice engine.'
+          'Same native conversation as the composer voice button. End always stops listening.'
       })
     ]
   })
@@ -792,7 +960,8 @@ function WorkshopPane() {
 export default {
   id: PLUGIN_ID,
   name: 'Voice HUD',
-  defaultEnabled: true,
+  /** Choice: off until enabled in Settings ▸ Plugins. */
+  defaultEnabled: false,
   register(ctx) {
     $workshop.set(ctx.storage.get('workshop', false))
     $suppressStockPill.set(ctx.storage.get('suppressStockPill', true))
@@ -806,7 +975,7 @@ export default {
     wireDomObserver()
     const offGw = wireGateway()
 
-    ctx.registerMany([
+    const disposeRegs = ctx.registerMany([
       {
         id: 'composer-top',
         area: COMPOSER_AREAS.top,
@@ -829,7 +998,6 @@ export default {
         id: 'workshop',
         area: 'panes',
         title: 'voice',
-        // Not shown until user enables workshop — still registered so palette can open it.
         when: () => $workshop.get(),
         data: {
           placement: 'floating',
@@ -846,9 +1014,19 @@ export default {
         data: {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
-          label: 'Voice: Toggle native conversation + HUD',
-          keywords: ['voice', 'hud', 'mic', 'listen', 'speech', 'jarvis'],
+          label: 'Voice HUD: Toggle native conversation',
+          keywords: ['voice', 'hud', 'mic', 'listen', 'speech', 'end'],
           run: () => toggleVoice()
+        }
+      },
+      {
+        id: 'end',
+        area: PALETTE_AREA,
+        data: {
+          id: 'voice-hud.end',
+          label: 'Voice HUD: End conversation (stop listening)',
+          keywords: ['voice', 'end', 'stop', 'listening'],
+          run: () => endVoice()
         }
       },
       {
@@ -856,7 +1034,7 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'voice-hud.workshop',
-          label: 'Voice: Toggle workshop floating pane',
+          label: 'Voice HUD: Toggle workshop pane',
           keywords: ['voice', 'workshop', 'floating'],
           run: () => {
             $workshop.set(!$workshop.get())
@@ -869,7 +1047,7 @@ export default {
         area: KEYBINDS_AREA,
         data: {
           id: 'voice-hud.toggle',
-          label: 'Voice: Toggle native conversation + HUD',
+          label: 'Voice HUD: Toggle native conversation',
           category: 'Voice',
           defaults: ['mod+shift+v'],
           run: () => toggleVoice()
@@ -877,15 +1055,27 @@ export default {
       }
     ])
 
-    if (typeof ctx.onUnload === 'function') {
-      ctx.onUnload(() => {
+    const cleanup = () => {
+      try {
         offGw()
-        stopDomObserver()
-        stopMeter()
-        stopSpeechSoft()
-        document.getElementById(STYLE_ID)?.remove()
-        setLiveAttr(false)
-      })
+      } catch {
+        /* ignore */
+      }
+      stopDomObserver()
+      stopAllCapture('unload')
+      sessionWanted = false
+      document.getElementById(STYLE_ID)?.remove()
+      setLiveAttr(false)
+      try {
+        disposeRegs?.()
+      } catch {
+        /* ignore */
+      }
     }
+
+    // Preferred API
+    if (typeof ctx.onDispose === 'function') ctx.onDispose(cleanup)
+    // Older builds
+    if (typeof ctx.onUnload === 'function') ctx.onUnload(cleanup)
   }
 }

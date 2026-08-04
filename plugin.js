@@ -1,23 +1,18 @@
 /**
- * voice-hud — optional skin over Hermes Desktop *native* voice conversation.
+ * voice-hud — in-composer live layer for Hermes Desktop native voice.
  *
- * Contract (plugin system):
- *  - Only imports @hermes/plugin-sdk + react*
- *  - defaultEnabled: true → works after server sync; disable in Settings ▸ Plugins
- *  - Skins composer.top when native voice is live; mic control in composer.actions
- *  - Never owns STT/submit — only toggles core via hermes:composer-voice-toggle
- *    or the core End button
- *  - When conversation ends (End / stop-word / core stop), ALL local capture
- *    (analyser, Web Speech) stops hard and does not restart
+ * Sits in the same dock as the typing bar (screenshot space):
+ *  - composer.top  → real-time transcript strip + image chips + mini orb
+ *  - NO extra mic in actions (core already has voice / dictate / wake)
+ *  - middleware    → voice text turns pick up staged composer images
  *
- * Install: $HERMES_HOME/desktop-plugins/voice-hud/plugin.js
- * Activate: Settings ▸ Plugins ▸ Voice HUD ON → Reload desktop plugins
+ * Choice: defaultEnabled false → Settings ▸ Plugins.
+ * Hard-stop: End / stop-word / pill gone → captureWanted=false, no restart.
  */
 import {
   Badge,
   Button,
   COMPOSER_AREAS,
-  Codicon,
   KEYBINDS_AREA,
   PALETTE_AREA,
   STATUSBAR_AREAS,
@@ -40,21 +35,19 @@ const STYLE_ID = 'voice-hud-css'
 const $nativeActive = atom(false)
 const $phase = atom(/** @type {Phase} */ ('idle'))
 const $level = atom(0)
-const $userText = atom('')
+/** Live interim + final caption (real-time). */
+const $liveText = atom('')
 const $agentText = atom('')
 const $elapsed = atom(0)
 const $error = atom('')
-/** Optional floating workshop — off by default. */
-const $workshop = atom(false)
-/** Hide stock voice pill while our strip is live (one chrome). */
-const $suppressStockPill = atom(true)
+/** @type {import('nanostores').WritableAtom<ScrapedAtt[]>} */
+const $images = atom(/** @type {ScrapedAtt[]} */ ([]))
 
 /**
- * Capture gate — when false, Web Speech onend MUST NOT restart and meter
- * must stay down. This is the fix for “stopped speaking but still listening”.
+ * @typedef {{ id: string, kind: 'image'|'file', label: string, previewUrl?: string, path?: string, detail?: string, refText?: string }} ScrapedAtt
  */
+
 let captureWanted = false
-/** True only after *we* successfully asked core to start (or mirrored start). */
 let sessionWanted = false
 
 const meter = {
@@ -69,27 +62,16 @@ const meter = {
   endWatch: 0
 }
 
-function formatTcg(ms) {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const m = Math.floor(total / 60)
-  const s = total % 60
-  const f = Math.floor((ms % 1000) / (1000 / 24))
-  const pad = (n, w = 2) => String(n).padStart(w, '0')
-  return `${pad(m)}:${pad(s)}.${pad(f)}`
-}
-
 function formatElapsed(sec) {
   const s = Math.max(0, Math.floor(sec))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
-// --- Core voice bus ----------------------------------------------------------
+// --- Core voice --------------------------------------------------------------
 
 function dispatchVoiceToggle() {
   try {
-    window.dispatchEvent(
-      new CustomEvent(VOICE_TOGGLE_EVENT, { detail: { target: 'main' } })
-    )
+    window.dispatchEvent(new CustomEvent(VOICE_TOGGLE_EVENT, { detail: { target: 'main' } }))
     return true
   } catch (err) {
     $error.set(err instanceof Error ? err.message : String(err))
@@ -97,17 +79,13 @@ function dispatchVoiceToggle() {
   }
 }
 
-/** Prefer clicking the live End control — calls endConversation() directly. */
 function clickCoreEnd() {
   if (typeof document === 'undefined') return false
   const btn =
     document.querySelector(
       '[data-slot="composer-root"] button[aria-label*="End" i], [data-slot="composer-dock"] button[aria-label*="End" i]'
-    ) ||
-    document.querySelector(
-      'button[aria-label*="End conversation" i], button[aria-label*="End voice" i]'
-    )
-  if (btn && typeof btn.click === 'function') {
+    ) || document.querySelector('button[aria-label*="End conversation" i]')
+  if (btn?.click) {
     btn.click()
     return true
   }
@@ -116,21 +94,20 @@ function clickCoreEnd() {
 
 function clickCoreStart() {
   if (typeof document === 'undefined') return false
+  // Prefer the waveform / start-voice control already in the composer actions
   const btn =
     document.querySelector(
       '[data-slot="composer-root"] button[aria-label*="Start voice" i], [data-slot="composer-dock"] button[aria-label*="Start voice" i]'
     ) ||
     document.querySelector(
-      'button[aria-label*="voice conversation" i]:not([aria-pressed="true"])'
+      '[data-slot="composer-root"] button[aria-label*="voice conversation" i]'
     )
-  if (btn && typeof btn.click === 'function') {
+  if (btn?.click) {
     btn.click()
     return true
   }
   return false
 }
-
-// --- HARD STOP — no restart --------------------------------------------------
 
 function stopSpeechSoft() {
   const rec = meter.speechRec
@@ -139,7 +116,7 @@ function stopSpeechSoft() {
   try {
     rec.onresult = null
     rec.onerror = null
-    rec.onend = null // critical: block auto-restart
+    rec.onend = null
     rec.abort?.()
     rec.stop?.()
   } catch {
@@ -148,14 +125,10 @@ function stopSpeechSoft() {
 }
 
 function stopMeter() {
-  if (meter.raf) {
-    cancelAnimationFrame(meter.raf)
-    meter.raf = 0
-  }
-  if (meter.timer) {
-    clearInterval(meter.timer)
-    meter.timer = 0
-  }
+  if (meter.raf) cancelAnimationFrame(meter.raf)
+  meter.raf = 0
+  if (meter.timer) clearInterval(meter.timer)
+  meter.timer = 0
   try {
     meter.ctx?.close()
   } catch {
@@ -163,62 +136,43 @@ function stopMeter() {
   }
   meter.ctx = null
   meter.analyser = null
-  if (meter.stream) {
+  meter.stream?.getTracks().forEach(t => {
     try {
-      meter.stream.getTracks().forEach(t => {
-        try {
-          t.stop()
-        } catch {
-          /* ignore */
-        }
-      })
+      t.stop()
     } catch {
       /* ignore */
     }
-  }
+  })
   meter.stream = null
   $level.set(0)
 }
 
-/** Full local teardown. Safe to call repeatedly. Does not touch core voice. */
-function stopAllCapture(reason) {
+function stopAllCapture() {
   captureWanted = false
   stopSpeechSoft()
   stopMeter()
-  $level.set(0)
-  if (reason) {
-    // keep last texts for a beat; phase goes idle
-  }
   $phase.set('idle')
   $elapsed.set(0)
+  $level.set(0)
   setLiveAttr(false)
 }
 
-/** End native conversation + local capture. Idempotent. */
 function endVoice() {
   haptic('close')
   sessionWanted = false
-  stopAllCapture('end')
+  stopAllCapture()
   $error.set('')
-
-  // Prefer End button (always ends) over toggle (could desync and start).
   const clicked = clickCoreEnd()
-  if (!clicked && $nativeActive.get()) {
-    dispatchVoiceToggle()
-  }
-
-  // If DOM still shows active shortly after, force toggle once more.
+  if (!clicked && $nativeActive.get()) dispatchVoiceToggle()
   if (meter.endWatch) clearTimeout(meter.endWatch)
   meter.endWatch = window.setTimeout(() => {
     meter.endWatch = 0
-    const still = detectNative().active
-    if (still) {
+    if (detectNative().active) {
       if (!clickCoreEnd()) dispatchVoiceToggle()
     }
-    stopAllCapture('end-watch')
+    stopAllCapture()
     $nativeActive.set(false)
-    $phase.set('idle')
-  }, 350)
+  }, 320)
 }
 
 function startVoice() {
@@ -226,10 +180,9 @@ function startVoice() {
   if ($nativeActive.get()) return
   haptic('open')
   sessionWanted = true
-  // Start core first; capture arms only after we observe active.
-  if (!clickCoreStart()) {
-    dispatchVoiceToggle()
-  }
+  $liveText.set('')
+  $agentText.set('')
+  if (!clickCoreStart()) dispatchVoiceToggle()
 }
 
 function toggleVoice() {
@@ -237,7 +190,7 @@ function toggleVoice() {
   else startVoice()
 }
 
-// --- Soft captions (never owns submit; killed on stop) -----------------------
+// --- Real-time transcription (Web Speech interim) ----------------------------
 
 function startSpeechSoft() {
   if (!captureWanted) return
@@ -247,30 +200,37 @@ function startSpeechSoft() {
     const rec = new SR()
     rec.continuous = true
     rec.interimResults = true
+    rec.maxAlternatives = 1
     rec.lang = navigator.language || 'en-US'
+    let committed = ''
     rec.onresult = event => {
       if (!captureWanted) return
       let interim = ''
-      let final = ''
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const r = event.results[i]
-        const t = r[0]?.transcript || ''
-        if (r.isFinal) final += t
-        else interim += t
+        const t = (r[0]?.transcript || '').trim()
+        if (!t) continue
+        if (r.isFinal) {
+          committed = (committed + ' ' + t).trim()
+        } else {
+          interim += (interim ? ' ' : '') + t
+        }
       }
-      const text = (final || interim).trim()
-      if (text) $userText.set(text)
+      const live = (committed + (interim ? (committed ? ' ' : '') + interim : '')).trim()
+      if (live) $liveText.set(live)
     }
-    rec.onerror = () => {
-      /* swallow — core STT is source of truth */
+    rec.onerror = e => {
+      // no-speech / aborted are normal
+      if (e?.error === 'not-allowed') {
+        $error.set('Microphone blocked for live captions')
+      }
     }
     rec.onend = () => {
-      // ONLY restart if capture still wanted AND native still live
       if (
         meter.speechRec === rec &&
         captureWanted &&
         $nativeActive.get() &&
-        $phase.get() === 'listening'
+        ($phase.get() === 'listening' || $phase.get() === 'idle')
       ) {
         try {
           rec.start()
@@ -282,35 +242,25 @@ function startSpeechSoft() {
     rec.start()
     meter.speechRec = rec
   } catch {
-    /* Electron often lacks Web Speech */
+    /* no Web Speech — core STT still works; live line fills from last bubble */
   }
 }
 
-function rmsFromTimeDomain(data) {
-  let sum = 0
+function rms(data) {
+  let s = 0
   for (let i = 0; i < data.length; i++) {
     const v = (data[i] - 128) / 128
-    sum += v * v
+    s += v * v
   }
-  return Math.sqrt(sum / Math.max(1, data.length))
+  return Math.sqrt(s / Math.max(1, data.length))
 }
 
-/**
- * Optional level meter. May fail if core holds the mic exclusively — fine.
- * Never blocks stop; tracks always torn down in stopMeter.
- */
 async function startMeter() {
-  if (!captureWanted || meter.analyser) return
-  if (!navigator.mediaDevices?.getUserMedia) return
+  if (!captureWanted || meter.analyser || !navigator.mediaDevices?.getUserMedia) return
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     })
-    // Race: conversation may have ended while permission dialog was open
     if (!captureWanted) {
       stream.getTracks().forEach(t => t.stop())
       return
@@ -322,24 +272,24 @@ async function startMeter() {
       return
     }
     const ctx = new AC()
-    const source = ctx.createMediaStreamSource(stream)
-    const analyser = ctx.createAnalyser()
-    analyser.fftSize = 512
-    analyser.smoothingTimeConstant = 0.7
-    source.connect(analyser)
+    const src = ctx.createMediaStreamSource(stream)
+    const an = ctx.createAnalyser()
+    an.fftSize = 512
+    an.smoothingTimeConstant = 0.72
+    src.connect(an)
     meter.ctx = ctx
-    meter.analyser = analyser
+    meter.analyser = an
     void ctx.resume()
-    const data = new Uint8Array(analyser.fftSize)
+    const data = new Uint8Array(an.fftSize)
     const tick = () => {
       if (!meter.analyser || !captureWanted) return
       meter.analyser.getByteTimeDomainData(data)
-      $level.set(Math.min(1, rmsFromTimeDomain(data) * 7.5))
+      $level.set(Math.min(1, rms(data) * 7.5))
       meter.raf = requestAnimationFrame(tick)
     }
     meter.raf = requestAnimationFrame(tick)
   } catch {
-    /* core holds mic — phase-driven orb only */
+    /* core holds mic */
   }
 }
 
@@ -360,47 +310,109 @@ function startElapsed() {
 function armCapture() {
   if (captureWanted) return
   captureWanted = true
-  $userText.set('')
-  $agentText.set('')
   startElapsed()
   void startMeter()
   startSpeechSoft()
 }
 
-// --- DOM observe native conversation ----------------------------------------
+// --- Images in composer ------------------------------------------------------
+
+function scrapeComposerAttachments() {
+  if (typeof document === 'undefined') return /** @type {ScrapedAtt[]} */ ([])
+  const root = document.querySelector('[data-slot="composer-attachments"]')
+  if (!root) return []
+  /** @type {ScrapedAtt[]} */
+  const out = []
+  const buttons = root.querySelectorAll('button[type="button"]')
+  let i = 0
+  for (const btn of buttons) {
+    // skip remove (×) buttons
+    const aria = (btn.getAttribute('aria-label') || '').toLowerCase()
+    if (aria.startsWith('remove') || btn.className.includes('absolute')) continue
+    const img = btn.querySelector('img')
+    const labelEl = btn.querySelector('span.truncate, span.block.truncate')
+    const label =
+      (labelEl?.textContent || '').trim() ||
+      img?.getAttribute('alt') ||
+      (aria.replace(/^preview\s*/i, '').trim() || `attachment-${i}`)
+    const tip = btn.closest('[data-state]') || btn.parentElement
+    const title = btn.getAttribute('title') || tip?.getAttribute('title') || ''
+    const previewUrl = img?.src || undefined
+    const pathGuess = title && !title.startsWith('data:') ? title : undefined
+    if (img || aria.includes('image') || previewUrl) {
+      out.push({
+        id: `hud-img-${i}`,
+        kind: 'image',
+        label,
+        previewUrl,
+        path: pathGuess,
+        detail: pathGuess,
+        refText: pathGuess ? `@image:${pathGuess}` : undefined
+      })
+      i++
+    } else if (label) {
+      out.push({
+        id: `hud-file-${i}`,
+        kind: 'file',
+        label,
+        path: pathGuess,
+        detail: pathGuess,
+        refText: pathGuess ? `@file:${pathGuess}` : undefined
+      })
+      i++
+    }
+  }
+  return out
+}
+
+/** Middleware: bare voice text picks up staged composer images. */
+function attachmentMiddleware(draft) {
+  try {
+    if (draft.attachments && draft.attachments.length > 0) return draft
+    const scraped = scrapeComposerAttachments().filter(a => a.kind === 'image')
+    if (!scraped.length) return draft
+    // Prefer structured attachments for the submit pipeline
+    return {
+      text: draft.text,
+      attachments: scraped.map(a => ({
+        id: a.id,
+        kind: 'image',
+        label: a.label,
+        previewUrl: a.previewUrl,
+        path: a.path,
+        detail: a.detail,
+        refText: a.refText
+      }))
+    }
+  } catch {
+    return draft
+  }
+}
+
+// --- Native detect -----------------------------------------------------------
 
 function detectNative() {
   if (typeof document === 'undefined') {
     return { active: false, phase: /** @type {Phase} */ ('idle') }
   }
-
   let hit = ''
-  const scopes = document.querySelectorAll(
-    '[data-slot="composer-root"], [data-slot="composer-dock"], [data-slot="composer-surface"]'
-  )
-  for (const scope of scopes) {
-    for (const el of scope.querySelectorAll('[role="status"]')) {
-      // Skip our own HUD status
-      if (el.getAttribute('data-voice-hud') === '1') continue
-      const t = (el.textContent || '').trim().toLowerCase()
-      if (!t) continue
-      if (t.includes('listen')) hit = 'listening'
-      else if (t.includes('transcrib') || t.includes('dictat')) hit = 'transcribing'
-      else if (t.includes('think')) hit = 'thinking'
-      else if (t.includes('speak') || t.includes('reading') || t.includes('preparing')) {
-        hit = 'speaking'
-      } else if (t.includes('mut')) hit = 'listening'
-      if (hit) break
-    }
+  for (const el of document.querySelectorAll(
+    '[data-slot="composer-root"] [role="status"], [data-slot="composer-dock"] [role="status"]'
+  )) {
+    if (el.getAttribute('data-voice-hud') === '1') continue
+    const t = (el.textContent || '').trim().toLowerCase()
+    if (!t) continue
+    if (t.includes('listen')) hit = 'listening'
+    else if (t.includes('transcrib') || t.includes('dictat')) hit = 'transcribing'
+    else if (t.includes('think')) hit = 'thinking'
+    else if (t.includes('speak') || t.includes('reading') || t.includes('preparing')) hit = 'speaking'
+    else if (t.includes('mut')) hit = 'listening'
     if (hit) break
   }
-
   const endBtn = document.querySelector(
     '[data-slot="composer-root"] button[aria-label*="End" i], [data-slot="composer-dock"] button[aria-label*="End" i]'
   )
-  // ConversationPill only mounts while voiceConversationActive
-  const active = Boolean(endBtn) || Boolean(hit && hit !== 'idle')
-
+  const active = Boolean(endBtn) || Boolean(hit)
   if (!hit && active) {
     for (const el of document.querySelectorAll('[aria-live="polite"]')) {
       if (el.getAttribute('data-voice-hud') === '1') continue
@@ -413,17 +425,13 @@ function detectNative() {
         hit = 'transcribing'
         break
       }
-      if (t.includes('speaking') || t.includes('reading') || t.includes('preparing')) {
+      if (t.includes('speaking') || t.includes('preparing') || t.includes('reading')) {
         hit = 'speaking'
         break
       }
     }
   }
-
-  return {
-    active,
-    phase: /** @type {Phase} */ (active ? hit || 'listening' : 'idle')
-  }
+  return { active, phase: /** @type {Phase} */ (active ? hit || 'listening' : 'idle') }
 }
 
 function scrapeLastUserBubble() {
@@ -431,20 +439,7 @@ function scrapeLastUserBubble() {
     '[data-role="user"], [data-message-role="user"], [data-slot*="user-message"]'
   )
   if (!nodes.length) return ''
-  return (nodes[nodes.length - 1].textContent || '').trim().slice(0, 420)
-}
-
-function onNativeBecameActive() {
-  sessionWanted = true
-  armCapture()
-  setLiveAttr(true)
-}
-
-function onNativeBecameInactive() {
-  sessionWanted = false
-  stopAllCapture('native-off')
-  $nativeActive.set(false)
-  $phase.set('idle')
+  return (nodes[nodes.length - 1].textContent || '').trim().slice(0, 500)
 }
 
 function wireDomObserver() {
@@ -452,11 +447,19 @@ function wireDomObserver() {
   meter.poll = window.setInterval(() => {
     const { active, phase } = detectNative()
     const was = $nativeActive.get()
+    $images.set(scrapeComposerAttachments())
 
-    if (active !== was) {
-      $nativeActive.set(active)
-      if (active) onNativeBecameActive()
-      else onNativeBecameInactive()
+    if (active && !was) {
+      $nativeActive.set(true)
+      sessionWanted = true
+      $liveText.set('')
+      $agentText.set('')
+      armCapture()
+      setLiveAttr(true)
+    } else if (!active && was) {
+      $nativeActive.set(false)
+      sessionWanted = false
+      stopAllCapture()
     } else {
       $nativeActive.set(active)
     }
@@ -464,40 +467,29 @@ function wireDomObserver() {
     if (active) {
       $phase.set(phase)
       setLiveAttr(true)
-      // If capture was killed somehow while still active, re-arm once
       if (!captureWanted && sessionWanted) armCapture()
+      // After core commits a turn, fill caption from bubble if soft STT empty
       if (phase === 'thinking' || phase === 'speaking' || phase === 'transcribing') {
         const bubble = scrapeLastUserBubble()
-        if (bubble && bubble.length >= ($userText.get() || '').length) {
-          $userText.set(bubble)
-        }
-      }
-      // While agent speaks, pause soft-speech restart noise (still ok to keep)
-      if (phase === 'speaking' || phase === 'thinking') {
-        // keep captureWanted true for session, but don't force speech rec
+        if (bubble && bubble.length > ($liveText.get() || '').length) $liveText.set(bubble)
       }
     } else if (captureWanted || sessionWanted) {
-      // belt-and-suspenders: inactive must kill listening
-      onNativeBecameInactive()
+      sessionWanted = false
+      stopAllCapture()
+      $nativeActive.set(false)
     }
-  }, 160)
+  }, 140)
 }
 
 function stopDomObserver() {
-  if (meter.poll) {
-    clearInterval(meter.poll)
-    meter.poll = 0
-  }
-  if (meter.endWatch) {
-    clearTimeout(meter.endWatch)
-    meter.endWatch = 0
-  }
+  if (meter.poll) clearInterval(meter.poll)
+  meter.poll = 0
+  if (meter.endWatch) clearTimeout(meter.endWatch)
+  meter.endWatch = 0
   setLiveAttr(false)
 }
 
-// --- CSS: one chrome with composer ------------------------------------------
-
-function ensureIntegratedCss() {
+function ensureCss() {
   if (typeof document === 'undefined') return
   let el = document.getElementById(STYLE_ID)
   if (!el) {
@@ -505,15 +497,13 @@ function ensureIntegratedCss() {
     el.id = STYLE_ID
     document.head.appendChild(el)
   }
-  el.textContent = $suppressStockPill.get()
-    ? `
-/* voice-hud: collapse stock VoiceActivity pill while our strip owns the dock */
+  // Hide stock VoiceActivity while our live strip is up — one clean bar
+  el.textContent = `
 [data-voice-hud-live="1"] [data-slot="composer-root"] [aria-live="polite"][role="status"].h-8:not([data-voice-hud]),
 [data-voice-hud-live="1"] [data-slot="composer-surface"] [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
   display: none !important;
 }
 `
-    : ''
 }
 
 function setLiveAttr(on) {
@@ -526,10 +516,8 @@ function setLiveAttr(on) {
     })
   if (on) document.documentElement.setAttribute('data-voice-hud-live', '1')
   else document.documentElement.removeAttribute('data-voice-hud-live')
-  ensureIntegratedCss()
+  ensureCss()
 }
-
-// --- Gateway agent chip ------------------------------------------------------
 
 function wireGateway() {
   return host.onEvent('*', event => {
@@ -547,331 +535,281 @@ function wireGateway() {
     } else if (type === 'message.delta') {
       const chunk = String(payload.text || payload.delta || '')
       if (chunk) {
-        $agentText.set(($agentText.get() + chunk).slice(-900))
+        $agentText.set(($agentText.get() + chunk).slice(-700))
         if ($nativeActive.get()) $phase.set('speaking')
       }
     } else if (type === 'message.complete') {
-      // Core returns to listening for the next turn — we stay armed until End
-      if ($nativeActive.get()) $phase.set('listening')
+      if ($nativeActive.get()) {
+        $phase.set('listening')
+        // next utterance — clear live line for fresh real-time caption
+        $liveText.set('')
+      }
     }
   })
 }
 
-// --- Fiber orb ---------------------------------------------------------------
+// --- Mini orb (inline, composer-scale) ---------------------------------------
 
-function FiberOrb({ size = 88 }) {
+function MiniOrb({ size = 36 }) {
   const ref = useRef(null)
   const level = useValue($level)
   const phase = useValue($phase)
-  const levelRef = useRef(level)
-  const phaseRef = useRef(phase)
-  levelRef.current = level
-  phaseRef.current = phase
+  const lr = useRef(level)
+  const pr = useRef(phase)
+  lr.current = level
+  pr.current = phase
 
   useEffect(() => {
-    const canvas = ref.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
+    const c = ref.current
+    if (!c) return
+    const ctx = c.getContext('2d')
     if (!ctx) return
     let raf = 0
     const t0 = performance.now()
     const dpr = Math.max(1, window.devicePixelRatio || 1)
-    const S = size
-    canvas.width = Math.round(S * dpr)
-    canvas.height = Math.round(S * dpr)
-    canvas.style.width = `${S}px`
-    canvas.style.height = `${S}px`
+    c.width = Math.round(size * dpr)
+    c.height = Math.round(size * dpr)
+    c.style.width = size + 'px'
+    c.style.height = size + 'px'
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-
-    const STRANDS = 120
+    const N = 48
     const draw = now => {
       const t = (now - t0) / 1000
-      const cx = S / 2
-      const cy = S / 2
-      const ph = phaseRef.current
-      const lv = levelRef.current
-      const live = ph === 'listening' || ph === 'speaking' || ph === 'transcribing'
-      const base =
-        ph === 'speaking' ? 0.5 : ph === 'listening' ? 0.38 : ph === 'thinking' ? 0.26 : 0.1
-      const amp = base + lv * (ph === 'speaking' ? 0.5 : 0.95)
-
-      ctx.clearRect(0, 0, S, S)
-      ctx.fillStyle = 'hsla(210, 55%, 8%, 0.92)'
+      const cx = size / 2
+      const cy = size / 2
+      const ph = pr.current
+      const lv = lr.current
+      const base = ph === 'speaking' ? 0.55 : ph === 'listening' ? 0.4 : 0.18
+      const amp = base + lv * 0.9
+      ctx.clearRect(0, 0, size, size)
+      const g = ctx.createRadialGradient(cx, cy, 1, cx, cy, size * 0.48)
+      g.addColorStop(0, `hsla(200,100%,60%,${0.5 + amp * 0.3})`)
+      g.addColorStop(0.45, `hsla(140,90%,50%,${0.25 + amp * 0.2})`)
+      g.addColorStop(1, 'hsla(50,90%,55%,0)')
+      ctx.fillStyle = g
       ctx.beginPath()
-      roundRect(ctx, 0.5, 0.5, S - 1, S - 1, 4)
+      ctx.arc(cx, cy, size * 0.48, 0, Math.PI * 2)
       ctx.fill()
-      ctx.strokeStyle = 'hsla(200, 40%, 40%, 0.35)'
-      ctx.lineWidth = 1
-      ctx.stroke()
-
-      const core = ctx.createRadialGradient(cx, cy, 1, cx, cy, S * 0.42)
-      core.addColorStop(0, `hsla(205, 100%, 55%, ${0.55 + amp * 0.25})`)
-      core.addColorStop(0.25, `hsla(185, 95%, 50%, ${0.35 + amp * 0.2})`)
-      core.addColorStop(0.55, `hsla(130, 90%, 48%, ${0.18 + amp * 0.12})`)
-      core.addColorStop(0.8, `hsla(55, 95%, 52%, ${0.1 + amp * 0.08})`)
-      core.addColorStop(1, 'hsla(300, 80%, 55%, 0)')
-      ctx.fillStyle = core
-      ctx.beginPath()
-      ctx.arc(cx, cy, S * 0.42, 0, Math.PI * 2)
-      ctx.fill()
-
-      for (let i = 0; i < STRANDS; i++) {
-        const hue = 190 + (i / STRANDS) * 170 + t * 40
-        const a0 = (i / STRANDS) * Math.PI * 2 + t * (0.5 + (i % 5) * 0.03)
-        const ring = S * (0.16 + (i % 9) * 0.008)
+      for (let i = 0; i < N; i++) {
+        const hue = 190 + (i / N) * 160 + t * 50
+        const a0 = (i / N) * Math.PI * 2 + t * 0.8
         ctx.beginPath()
-        const segs = 26
-        for (let s = 0; s <= segs; s++) {
-          const u = s / segs
-          const wobble = Math.sin(t * 3.2 + i * 0.4 + u * 10) * S * 0.028 * amp
-          const tube = Math.sin(t * 5 + i + u * 4) * S * 0.018 * (0.5 + amp)
-          const r = ring + wobble + tube + u * S * 0.04 * amp
-          const a = a0 + u * (2.2 + Math.sin(i * 0.3) * 0.5)
+        for (let s = 0; s <= 16; s++) {
+          const u = s / 16
+          const r =
+            size * (0.12 + u * 0.22) +
+            Math.sin(t * 4 + i + u * 6) * size * 0.04 * amp
+          const a = a0 + u * 1.8
           const x = cx + Math.cos(a) * r
-          const y = cy + Math.sin(a) * r * 0.96
+          const y = cy + Math.sin(a) * r
           if (s === 0) ctx.moveTo(x, y)
           else ctx.lineTo(x, y)
         }
-        const alpha = 0.14 + amp * 0.38 + (live ? 0.06 : 0)
-        ctx.strokeStyle = `hsla(${hue % 360}, 92%, ${52 + amp * 14}%, ${alpha})`
-        ctx.lineWidth = 0.7 + (i % 4) * 0.2
+        ctx.strokeStyle = `hsla(${hue % 360},90%,60%,${0.25 + amp * 0.4})`
+        ctx.lineWidth = 0.8
         ctx.stroke()
       }
-
-      ctx.beginPath()
-      ctx.arc(cx, cy, S * (0.14 + amp * 0.04), 0, Math.PI * 2)
-      ctx.strokeStyle = `hsla(195, 100%, 70%, ${0.35 + amp * 0.4})`
-      ctx.lineWidth = 1.4
-      ctx.stroke()
-
       raf = requestAnimationFrame(draw)
     }
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
   }, [size])
 
-  return jsx('canvas', { ref, 'aria-hidden': true, className: 'block shrink-0' })
-}
-
-function roundRect(ctx, x, y, w, h, r) {
-  const rr = Math.min(r, w / 2, h / 2)
-  ctx.moveTo(x + rr, y)
-  ctx.arcTo(x + w, y, x + w, y + h, rr)
-  ctx.arcTo(x + w, y + h, x, y + h, rr)
-  ctx.arcTo(x, y + h, x, y, rr)
-  ctx.arcTo(x, y, x + w, y, rr)
-  ctx.closePath()
-}
-
-function LevelBars({ level, active }) {
-  const bars = [0.45, 0.7, 1, 0.7, 0.45]
-  const n = Math.max(0, Math.min(level, 1))
-  return jsxs('div', {
+  return jsx('canvas', {
+    ref,
     'aria-hidden': true,
-    className: 'flex h-3.5 items-center gap-0.5',
-    children: bars.map((w, i) =>
-      jsx(
+    className: 'block shrink-0 rounded-full'
+  })
+}
+
+function LevelDots({ level, active }) {
+  const n = 5
+  return jsxs('span', {
+    'aria-hidden': true,
+    className: 'flex h-3 items-end gap-0.5',
+    children: Array.from({ length: n }, (_, i) => {
+      const thresh = (i + 1) / n
+      const on = active && level >= thresh * 0.55
+      return jsx(
         'span',
         {
           className: cn(
-            'w-0.5 rounded-full bg-current transition-[height,opacity] duration-100',
-            active ? 'opacity-80' : 'opacity-40'
+            'w-0.5 rounded-full transition-all duration-75',
+            on ? 'bg-primary' : 'bg-muted-foreground/30'
           ),
-          style: {
-            height: `${(active ? 0.28 + Math.min(0.72, n * w) : 0.28) * 100}%`
-          }
+          style: { height: `${30 + thresh * 70}%` }
         },
         i
       )
-    )
+    })
   })
 }
 
-function PulseDot({ live }) {
-  return jsx('span', {
-    'aria-hidden': true,
-    className: cn(
-      'h-2 w-2 shrink-0 rounded-full',
-      live
-        ? 'animate-pulse bg-green-400 shadow-[0_0_6px_theme(colors.green.400)]'
-        : 'bg-(--ui-text-tertiary) opacity-50'
-    )
-  })
-}
-
-function phaseLabel(phase) {
-  if (phase === 'listening') return 'Listening'
-  if (phase === 'transcribing') return 'Transcribing'
-  if (phase === 'thinking') return 'Thinking'
-  if (phase === 'speaking') return 'Speaking'
+function phaseLabel(p) {
+  if (p === 'listening') return 'Listening'
+  if (p === 'transcribing') return 'Transcribing'
+  if (p === 'thinking') return 'Thinking'
+  if (p === 'speaking') return 'Speaking'
   return 'Voice'
 }
 
-// --- UI ----------------------------------------------------------------------
-
-function ComposerIntegratedHud() {
+/**
+ * In-composer live strip — same width language as the dock, flat, no Tip spam.
+ * Only mounts while native voice is live.
+ */
+function LiveStrip() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
   const level = useValue($level)
-  const userText = useValue($userText)
-  const agentText = useValue($agentText)
+  const live = useValue($liveText)
+  const agent = useValue($agentText)
   const elapsed = useValue($elapsed)
+  const images = useValue($images)
   const error = useValue($error)
 
   if (!active) {
     if (error) {
       return jsx('div', {
         className:
-          'mb-1 flex h-8 items-center gap-2 rounded-xl border border-destructive/35 bg-destructive/10 px-2.5 text-xs text-destructive',
+          'mb-1 rounded-lg border border-destructive/30 bg-destructive/10 px-2 py-1 text-[0.7rem] text-destructive',
         children: error
       })
     }
     return null
   }
 
-  const you =
-    phase === 'listening' && !userText
-      ? '…'
-      : phase === 'transcribing' && !userText
+  const listening = phase === 'listening' || phase === 'transcribing'
+  const caption =
+    live ||
+    (phase === 'listening'
+      ? 'Listening…'
+      : phase === 'transcribing'
         ? 'Transcribing…'
-        : userText || '…'
+        : phase === 'thinking'
+          ? 'Thinking…'
+          : phase === 'speaking'
+            ? agent || 'Speaking…'
+            : '…')
+
+  const imgAtt = images.filter(a => a.kind === 'image' && a.previewUrl)
 
   return jsxs('div', {
     className: cn(
-      'mb-1 flex flex-col gap-1.5 rounded-xl border px-2.5 py-2 text-xs',
-      'border-border/55 bg-muted/55 text-muted-foreground',
-      'shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] backdrop-blur-sm',
-      phase === 'speaking' && 'border-primary/20 bg-primary/10 text-primary'
+      // Match composer surface — sits inside the same padded dock
+      'mb-0.5 flex flex-col gap-1.5 rounded-xl border px-2.5 py-2',
+      'border-border/55 bg-muted/40 text-muted-foreground',
+      'shadow-[inset_0_1px_0_rgba(255,255,255,0.2)] backdrop-blur-sm',
+      phase === 'speaking' && 'border-primary/25 bg-primary/8'
     ),
-    'aria-live': 'polite',
     role: 'status',
+    'aria-live': 'polite',
     'data-voice-hud': '1',
     children: [
+      // Row 1: status + levels + end — height ~ stock controls
       jsxs('div', {
         className: 'flex h-7 items-center gap-2',
         children: [
-          jsx(PulseDot, { live: phase === 'listening' || phase === 'speaking' }),
           jsx('span', {
-            className: 'shrink-0 font-medium text-foreground/85',
+            className: cn(
+              'size-1.5 shrink-0 rounded-full',
+              listening ? 'animate-pulse bg-green-400' : phase === 'speaking' ? 'bg-primary' : 'bg-muted-foreground/50'
+            )
+          }),
+          jsx('span', {
+            className: 'shrink-0 text-[0.7rem] font-medium text-foreground/85',
             children: phaseLabel(phase)
           }),
           jsx('span', {
-            className: 'font-mono text-[0.6875rem] text-muted-foreground/85',
+            className: 'font-mono text-[0.65rem] text-muted-foreground/80',
             children: formatElapsed(elapsed / 1000)
           }),
-          jsx(LevelBars, {
-            level,
-            active: phase === 'listening' || phase === 'speaking'
-          }),
-          jsx('span', {
-            className:
-              'ml-auto font-mono text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
-            children: 'TCG ' + formatTcg(elapsed)
-          }),
+          jsx(LevelDots, { level, active: listening || phase === 'speaking' }),
+          imgAtt.length
+            ? jsx(Badge, {
+                variant: 'muted',
+                children: `${imgAtt.length} img`
+              })
+            : null,
+          jsx('div', { className: 'ml-auto' }),
+          jsx(MiniOrb, { size: 28 }),
           jsx(Button, {
-            size: 'sm',
             type: 'button',
+            size: 'sm',
             variant: 'ghost',
-            className: 'h-6 shrink-0 rounded-full px-2 text-[0.6875rem]',
+            className: 'h-6 rounded-full px-2 text-[0.68rem]',
             onClick: () => endVoice(),
             children: 'End'
           })
         ]
       }),
-      jsxs('div', {
-        className: 'flex items-stretch gap-2',
-        children: [
-          jsxs('div', {
-            className: 'flex min-w-0 flex-1 flex-col gap-1.5',
+
+      // Image thumbs — same row family as AttachmentList
+      imgAtt.length
+        ? jsxs('div', {
+            className: 'flex max-w-full flex-wrap items-center gap-1.5',
             children: [
-              jsxs('div', {
-                className: cn(
-                  'min-h-[2rem] rounded-lg border px-2.5 py-1.5',
-                  'border-(--ui-stroke-tertiary) bg-(--ui-widget-surface-background,var(--ui-bg-quaternary))'
-                ),
-                children: [
-                  jsx('div', {
+              ...imgAtt.slice(0, 6).map(a =>
+                jsx(
+                  'span',
+                  {
                     className:
-                      'mb-0.5 text-[0.5625rem] font-medium uppercase tracking-[0.14em] text-(--ui-text-quaternary)',
-                    children: 'You'
-                  }),
-                  jsx('div', {
-                    className: cn(
-                      'truncate text-[0.8125rem] leading-snug tracking-wide text-foreground',
-                      userText && 'font-semibold uppercase'
-                    ),
-                    title: you,
-                    children: you
-                  })
-                ]
-              }),
-              agentText
-                ? jsxs('div', {
-                    className: cn(
-                      'min-h-[1.75rem] rounded-lg border px-2.5 py-1.5',
-                      'border-primary/20 bg-primary/5'
-                    ),
-                    children: [
-                      jsx('div', {
-                        className:
-                          'mb-0.5 text-[0.5625rem] font-medium uppercase tracking-[0.14em] text-(--ui-text-quaternary)',
-                        children: 'Hermes'
-                      }),
-                      jsx('div', {
-                        className:
-                          'line-clamp-2 text-[0.75rem] leading-snug text-foreground/90',
-                        title: agentText,
-                        children: agentText
-                      })
-                    ]
-                  })
-                : null
+                      'relative size-9 overflow-hidden rounded-lg border border-border/55 bg-muted/35',
+                    title: a.label,
+                    children: jsx('img', {
+                      src: a.previewUrl,
+                      alt: a.label,
+                      className: 'size-full object-cover',
+                      draggable: false
+                    })
+                  },
+                  a.id
+                )
+              ),
+              jsx('span', {
+                className: 'text-[0.62rem] text-muted-foreground/70',
+                children: 'with voice turn'
+              })
             ]
+          })
+        : null,
+
+      // Real-time transcript — primary line in the dock
+      jsxs('div', {
+        className: cn(
+          'min-h-[1.5rem] rounded-lg border px-2.5 py-1.5',
+          'border-(--ui-stroke-tertiary) bg-background/40'
+        ),
+        children: [
+          jsx('div', {
+            className:
+              'mb-0.5 text-[0.55rem] font-medium uppercase tracking-[0.14em] text-(--ui-text-quaternary)',
+            children: listening ? 'Live' : phase === 'speaking' ? 'Hermes' : 'You'
           }),
-          jsx(FiberOrb, { size: 88 })
+          jsx('div', {
+            className: cn(
+              'text-[0.8125rem] leading-snug text-foreground',
+              listening && live && 'font-medium',
+              !live && 'text-muted-foreground/70'
+            ),
+            children:
+              phase === 'speaking' && agent
+                ? agent
+                : caption
+          })
         ]
       })
     ]
   })
 }
 
-function ComposerActionControl() {
+/** Quiet status chip only — no second mic in the composer action row. */
+function StatusChip() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
   return jsx(Tip, {
     label: active
-      ? 'End native voice conversation (stops listening)'
-      : 'Start native voice conversation — HUD skins the Desktop loop',
-    children: jsx(Button, {
-      type: 'button',
-      size: 'icon-sm',
-      variant: active ? 'secondary' : 'ghost',
-      'aria-pressed': active,
-      'aria-label': active ? 'End voice conversation' : 'Start voice conversation',
-      onClick: () => {
-        haptic(active ? 'close' : 'open')
-        toggleVoice()
-      },
-      children: active
-        ? jsx(PulseDot, { live: phase === 'listening' || phase === 'speaking' })
-        : jsx(Codicon, { name: 'mic', size: '0.875rem' })
-    })
-  })
-}
-
-function StatusChip() {
-  const active = useValue($nativeActive)
-  const phase = useValue($phase)
-  const level = useValue($level)
-  const label = !active
-    ? 'voice hud'
-    : phase === 'listening'
-      ? `hud · ${Math.round(level * 100)}%`
-      : `hud · ${phase}`
-
-  return jsx(Tip, {
-    label:
-      'Voice HUD (optional). Skins Desktop native voice. Click to start/end. Disable anytime in Settings → Plugins.',
+      ? 'Voice HUD live — click to end (stops listening)'
+      : 'Voice HUD — skins Desktop voice. Use the composer voice control, or click here to start.',
     children: jsx('button', {
       type: 'button',
       className: cn(
@@ -884,109 +822,36 @@ function StatusChip() {
       },
       children: jsx(Badge, {
         variant: active ? 'default' : 'muted',
-        children: label
+        children: active ? `hud · ${phase}` : 'hud'
       })
     })
-  })
-}
-
-function WorkshopPane() {
-  const on = useValue($workshop)
-  const active = useValue($nativeActive)
-  if (!on) {
-    return jsxs('div', {
-      className:
-        'flex h-full flex-col items-center justify-center gap-3 p-4 text-center text-sm',
-      children: [
-        jsx('p', {
-          className: 'max-w-[14rem] text-(--ui-text-tertiary)',
-          children:
-            'Optional workshop canvas. Main HUD lives in the composer with native Desktop voice.'
-        }),
-        jsx(Button, {
-          type: 'button',
-          size: 'sm',
-          variant: 'secondary',
-          onClick: () => $workshop.set(true),
-          children: 'Show workshop'
-        })
-      ]
-    })
-  }
-  return jsxs('div', {
-    className: 'flex h-full flex-col gap-2 p-3',
-    children: [
-      jsxs('div', {
-        className: 'flex items-center justify-between gap-2',
-        children: [
-          jsx('span', {
-            className: 'text-xs font-medium text-(--ui-text-secondary)',
-            children: 'Voice workshop'
-          }),
-          jsx(Button, {
-            type: 'button',
-            size: 'sm',
-            variant: 'text',
-            onClick: () => $workshop.set(false),
-            children: 'Hide'
-          })
-        ]
-      }),
-      jsx('div', { className: 'h-px bg-(--ui-stroke-tertiary)' }),
-      jsx(ComposerIntegratedHud, {}),
-      !active
-        ? jsx(Button, {
-            type: 'button',
-            className: 'mt-auto',
-            onClick: () => startVoice(),
-            children: 'Start native voice'
-          })
-        : jsx(Button, {
-            type: 'button',
-            className: 'mt-auto',
-            variant: 'destructive',
-            onClick: () => endVoice(),
-            children: 'End voice (stop listening)'
-          }),
-      jsx('p', {
-        className: 'text-[0.625rem] leading-relaxed text-(--ui-text-quaternary)',
-        children:
-          'Same native conversation as the composer voice button. End always stops listening.'
-      })
-    ]
   })
 }
 
 export default {
   id: PLUGIN_ID,
   name: 'Voice HUD',
-  /** On by default once installed/synced; disable anytime in Settings ▸ Plugins. */
-  defaultEnabled: true,
+  defaultEnabled: false,
   register(ctx) {
-    $workshop.set(ctx.storage.get('workshop', false))
-    $suppressStockPill.set(ctx.storage.get('suppressStockPill', true))
-    $workshop.listen(v => ctx.storage.set('workshop', v))
-    $suppressStockPill.listen(v => {
-      ctx.storage.set('suppressStockPill', v)
-      ensureIntegratedCss()
-    })
-
-    ensureIntegratedCss()
+    ensureCss()
     wireDomObserver()
     const offGw = wireGateway()
 
     const disposeRegs = ctx.registerMany([
       {
-        id: 'composer-top',
+        id: 'live-strip',
         area: COMPOSER_AREAS.top,
-        order: 5,
-        render: () => jsx(ComposerIntegratedHud, {})
+        order: 1,
+        render: () => jsx(LiveStrip, {})
       },
+      // Voice turns can include images already staged in the composer (+)
       {
-        id: 'composer-action',
-        area: COMPOSER_AREAS.actions,
+        id: 'attach-mw',
+        area: COMPOSER_AREAS.middleware,
         order: 40,
-        render: () => jsx(ComposerActionControl, {})
+        data: {
+          handler: attachmentMiddleware
+        }
       },
       {
         id: 'chip',
@@ -995,27 +860,13 @@ export default {
         render: () => jsx(StatusChip, {})
       },
       {
-        id: 'workshop',
-        area: 'panes',
-        title: 'voice',
-        when: () => $workshop.get(),
-        data: {
-          placement: 'floating',
-          anchor: 'top-right',
-          width: '340px',
-          height: '420px',
-          uncloseable: true
-        },
-        render: () => jsx(WorkshopPane, {})
-      },
-      {
         id: 'toggle',
         area: PALETTE_AREA,
         data: {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
           label: 'Voice HUD: Toggle native conversation',
-          keywords: ['voice', 'hud', 'mic', 'listen', 'speech', 'end'],
+          keywords: ['voice', 'hud', 'mic', 'listen'],
           run: () => toggleVoice()
         }
       },
@@ -1024,26 +875,13 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'voice-hud.end',
-          label: 'Voice HUD: End conversation (stop listening)',
-          keywords: ['voice', 'end', 'stop', 'listening'],
+          label: 'Voice HUD: End (stop listening)',
+          keywords: ['voice', 'end', 'stop'],
           run: () => endVoice()
         }
       },
       {
-        id: 'workshop-toggle',
-        area: PALETTE_AREA,
-        data: {
-          id: 'voice-hud.workshop',
-          label: 'Voice HUD: Toggle workshop pane',
-          keywords: ['voice', 'workshop', 'floating'],
-          run: () => {
-            $workshop.set(!$workshop.get())
-            haptic('selection')
-          }
-        }
-      },
-      {
-        id: 'toggle-bind',
+        id: 'bind',
         area: KEYBINDS_AREA,
         data: {
           id: 'voice-hud.toggle',
@@ -1062,7 +900,7 @@ export default {
         /* ignore */
       }
       stopDomObserver()
-      stopAllCapture('unload')
+      stopAllCapture()
       sessionWanted = false
       document.getElementById(STYLE_ID)?.remove()
       setLiveAttr(false)
@@ -1072,10 +910,7 @@ export default {
         /* ignore */
       }
     }
-
-    // Preferred API
     if (typeof ctx.onDispose === 'function') ctx.onDispose(cleanup)
-    // Older builds
     if (typeof ctx.onUnload === 'function') ctx.onUnload(cleanup)
   }
 }

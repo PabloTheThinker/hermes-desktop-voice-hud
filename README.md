@@ -1,60 +1,41 @@
 # Hermes Desktop Voice HUD
 
-Optional **skin** over Hermes Desktop’s native voice conversation — not a second STT engine.
+Optional **in-composer** live layer for Hermes Desktop’s native voice conversation.
 
-When enabled, a Mark II–style strip mounts on the composer (YOU caption + fiber orb + Hermes stream). **End always stops listening.**
+Sits in the same dock as the typing bar: real-time transcript, mini orb, image chips, End. Uses the **existing** Desktop voice controls (no second mic).
 
-> Fan-inspired UI only. Not affiliated with Marvel, Disney, or Iron Man / J.A.R.V.I.S.
+> Fan-inspired UI only. Not affiliated with Marvel / Disney / J.A.R.V.I.S.
 
-## Server-first install (recommended)
+## Choice
 
-If Hermes Desktop connects **remotely** to a shared backend (e.g. parallax), install the plugin **once on that server**. Every Desktop client pulls it automatically on connect — **no laptop install**.
+`defaultEnabled: false` — turn on in **Settings → Plugins → Voice HUD**.
+
+## What you get
+
+| Piece | Role |
+|--------|------|
+| **Live strip** (`composer.top`) | Real-time caption, phase, levels, mini orb, End |
+| **Images** | Thumbnails of staged composer attachments; middleware attaches them to voice turns when possible |
+| **Native voice** | Start with Desktop’s voice control (or status chip / Mod+Shift+V) |
+| **Hard stop** | End / stop-word → listening fully stops |
+
+No extra mic in the action row — stays clean with model · mic · wake · voice.
+
+## Install
 
 ```bash
-# on the machine that runs `hermes serve` (as the hermes home user)
-curl -fsSL https://raw.githubusercontent.com/PabloTheThinker/hermes-desktop-voice-hud/main/install.sh \
-  | HERMES_HOME=/home/ilo/.hermes bash
-# → $HERMES_HOME/desktop-plugins/voice-hud/plugin.js
+git clone https://github.com/PabloTheThinker/hermes-desktop-voice-hud.git
+cd hermes-desktop-voice-hud
+./install.sh
 ```
 
-Then reopen Hermes Desktop (or wait for the next reconnect). It mirrors  
-`$remote_hermes_home/desktop-plugins/*/plugin.js` into the local Electron plugin door.
-
-## Laptop-only install
-
-Only needed when Desktop runs **locally** against a local backend (or you want a local override):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/PabloTheThinker/hermes-desktop-voice-hud/main/install.sh | bash
-# → ~/.hermes/desktop-plugins/voice-hud/plugin.js
-```
-
-In Desktop: **⌘/Ctrl+K → Reload desktop plugins**.
-
-## Activate
-
-1. Open a chat  
-2. Use the **Voice HUD mic** in the composer actions (or **Mod+Shift+V**)  
-3. **End** when done — listening stops with the native conversation  
-
-Optional: Settings → Plugins → Voice HUD (on by default after install; can disable).
-
-Status bar chip only appears if the status bar is shown (**Toggle status bar** in the palette).
-
-## Features
-
-- **Native voice only** — same STT/VAD/submit as core Desktop voice  
-- **Composer strip** + action mic  
-- **Hard stop** — End / stop-word kills local capture  
-- Optional floating workshop pane (palette: Voice HUD: Toggle workshop)
-
-## Requirements
-
-- Hermes Desktop (with remote plugin sync if using server install)  
-- Mic permission  
-- STT configured on the backend  
-- Active chat session  
+1. Settings → Plugins → **Voice HUD** ON  
+2. Reload desktop plugins  
+3. Attach images with **+** if needed  
+4. Start Desktop voice  
+5. Speak — live line updates in real time  
+6. **End** stops listening  
 
 ## License
 
-MIT — see LICENSE.
+MIT

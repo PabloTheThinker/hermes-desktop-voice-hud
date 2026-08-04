@@ -29,25 +29,26 @@ While you talk, a glass **speech chip** fills with your words, a multicolor **fi
 
 ## Install
 
-### One-shot copy
+### Clone + install script
 
 ```bash
-# default profile
-mkdir -p ~/.hermes/desktop-plugins
-git clone https://github.com/PabloTheThinker/hermes-desktop-voice-hud.git \
-  ~/.hermes/desktop-plugins/voice-hud-src
-cp -a ~/.hermes/desktop-plugins/voice-hud-src/plugin.js \
-  ~/.hermes/desktop-plugins/voice-hud/plugin.js
-# folder name MUST be voice-hud (matches plugin id)
-mkdir -p ~/.hermes/desktop-plugins/voice-hud
-cp ~/.hermes/desktop-plugins/voice-hud-src/plugin.js \
-  ~/.hermes/desktop-plugins/voice-hud/plugin.js
+git clone https://github.com/PabloTheThinker/hermes-desktop-voice-hud.git
+cd hermes-desktop-voice-hud
+./install.sh
+# → ~/.hermes/desktop-plugins/voice-hud/plugin.js
 ```
 
-Or use the helper:
+Or one-liner (default profile):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PabloTheThinker/hermes-desktop-voice-hud/main/install.sh | bash
+```
+
+Manual copy (folder name **must** be `voice-hud`):
+
+```bash
+mkdir -p ~/.hermes/desktop-plugins/voice-hud
+cp plugin.js ~/.hermes/desktop-plugins/voice-hud/
 ```
 
 ### Named Hermes profile

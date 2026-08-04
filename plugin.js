@@ -519,14 +519,13 @@ function phaseTone(phase) {
   return 'muted'
 }
 
-/** Inline pulse dot matching the core StatusDot color tokens (not a plugin-sdk export). */
 function PulseDot({ tone }) {
   const cls =
     tone === 'good'
-      ? 'bg-green-400 shadow-[0_0_6px_theme(colors.green.400)] animate-pulse-dot'
+      ? 'bg-green-400 shadow-[0_0_6px_theme(colors.green.400)] animate-pulse'
       : tone === 'warn'
-        ? 'bg-amber-400 shadow-[0_0_6px_theme(colors.amber.400)]'
-        : 'bg-(--ui-text-tertiary)'
+        ? 'bg-amber-400 shadow-[0_0_6px_theme(colors.amber.400)] animate-pulse'
+        : 'bg-(--ui-text-tertiary) opacity-60'
   return jsx('span', {
     'aria-hidden': true,
     className: cn('h-2 w-2 shrink-0 rounded-full', cls)

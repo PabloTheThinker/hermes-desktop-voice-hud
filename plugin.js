@@ -1,11 +1,13 @@
 /**
- * voice-hud — ChatGPT Live–style voice **inside the chat session**.
+ * voice-hud — ChatGPT desktop Voice layout (in-session).
  *
- * - Soft orb + ripples (not fiber clutter)
- * - Dark glass card in composer.top — does NOT cover whole Desktop
- * - YOU / ILO words stay readable (long hold)
- * - Native hermes:voice-bus only (Desktop Whisper). No second mic.
+ * Reference (OpenAI desktop Voice / user shot):
+ *  • Chat transcript stays fully visible (no full-desktop cover)
+ *  • Soft blue–white orb floats above the composer
+ *  • Minimal controls under orb: mic · speaker · End
+ *  • Words optional / light — conversation is the page
  *
+ * Native: hermes:voice-bus only. No second mic.
  * defaultEnabled: true. Imports: @hermes/plugin-sdk + react* only.
  */
 import {
@@ -31,8 +33,8 @@ const VOICE_BUS_EVENT = 'hermes:voice-bus'
 const STYLE_ID = 'voice-hud-css'
 const END_MISS_TOLERANCE = 12
 const CORE_END_RE = /end voice conversation/i
-const WORD_HOLD_MS = 5000
-const WORD_FADE_MS = 1400
+const WORD_HOLD_MS = 5500
+const WORD_FADE_MS = 1200
 const SESSION_HOLD_MS = 2500
 const LEGACY_PORTAL_ID = 'voice-hud-live-portal'
 
@@ -51,6 +53,8 @@ const $busOk = atom(false)
 const $ghostText = atom('')
 const $ghostRole = atom(/** @type {'you' | 'agent' | ''} */ (''))
 const $ghostOpacity = atom(0)
+const $micMuted = atom(false)
+const $speakerMuted = atom(false)
 
 let pollTimer = 0
 let endWatch = 0
@@ -207,8 +211,7 @@ function showGhostWords(text, role, opts = {}) {
 
 function scheduleFade(extendOnly) {
   clearFadeTimers()
-  // sticky partials: long hold; committed: still long enough to read
-  const hold = extendOnly ? WORD_HOLD_MS + 1500 : WORD_HOLD_MS
+  const hold = extendOnly ? WORD_HOLD_MS + 1200 : WORD_HOLD_MS
   fadeTimer = window.setTimeout(() => {
     fadeTimer = 0
     const start = performance.now()
@@ -234,18 +237,16 @@ function scheduleFade(extendOnly) {
 
 function killLegacyPortal() {
   if (typeof document === 'undefined') return
-  const el = document.getElementById(LEGACY_PORTAL_ID)
-  if (el) el.remove()
+  document.getElementById(LEGACY_PORTAL_ID)?.remove()
+  document.documentElement.removeAttribute('data-voice-hud-live')
 }
 
 function setLiveAttr(on) {
   if (typeof document === 'undefined') return
-  // Session-local only — never mark whole Desktop / documentElement
   document.querySelectorAll('[data-slot="composer-root"], [data-slot="composer-dock"]').forEach(n => {
     if (on) n.setAttribute('data-voice-hud-live', '1')
     else n.removeAttribute('data-voice-hud-live')
   })
-  document.documentElement.removeAttribute('data-voice-hud-live')
   killLegacyPortal()
   ensureCss()
 }
@@ -258,6 +259,8 @@ function resetSessionUi() {
   $captionPartial.set(false)
   $agentLine.set('')
   $mode.set('off')
+  $micMuted.set(false)
+  $speakerMuted.set(false)
   clearGhost()
   endMisses = 0
   ending = false
@@ -314,7 +317,41 @@ function toggleVoice() {
   } else startVoice()
 }
 
-// --- Native voice bus --------------------------------------------------------
+function toggleMicMute() {
+  const next = !$micMuted.get()
+  $micMuted.set(next)
+  haptic('tap')
+  // Best-effort: click core mute if present
+  try {
+    const btn = [...document.querySelectorAll('[data-slot="composer-root"] button, [data-slot="composer-dock"] button')].find(
+      b => /mute|unmute/i.test(b.getAttribute('aria-label') || '')
+    )
+    if (btn && !isHudNode(btn)) btn.click()
+  } catch {
+    /* ignore */
+  }
+}
+
+function toggleSpeakerMute() {
+  $speakerMuted.set(!$speakerMuted.get())
+  haptic('tap')
+  // Pause any playing media elements as a soft mute fallback
+  try {
+    if ($speakerMuted.get()) {
+      document.querySelectorAll('audio, video').forEach(el => {
+        try {
+          el.pause?.()
+        } catch {
+          /* ignore */
+        }
+      })
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+// --- Bus --------------------------------------------------------------------
 
 function onVoiceBus(ev) {
   const d = ev?.detail
@@ -335,8 +372,9 @@ function onVoiceBus(ev) {
     const cap = d.caption.trim()
     $caption.set(cap)
     $captionPartial.set(Boolean(d.partial))
-    // Always surface YOU words when bus has a caption
-    showGhostWords(cap, 'you', { sticky: Boolean(d.partial) || phase === 'listening' || phase === 'recording' })
+    showGhostWords(cap, 'you', {
+      sticky: Boolean(d.partial) || phase === 'listening' || phase === 'recording'
+    })
   }
 
   if (active && !$nativeActive.get()) {
@@ -346,14 +384,11 @@ function onVoiceBus(ev) {
     setLiveAttr(true)
   }
 
-  if (!active && $nativeActive.get() && !findCoreEndButton()) {
-    return
-  }
+  if (!active && $nativeActive.get() && !findCoreEndButton()) return
 
   if (active) {
     $nativeActive.set(true)
     setLiveAttr(true)
-    const prev = $phase.get()
     if (phase === 'recording') $phase.set('listening')
     else if (
       phase === 'listening' ||
@@ -364,11 +399,6 @@ function onVoiceBus(ev) {
     ) {
       $phase.set(phase === 'idle' ? 'listening' : phase)
     }
-
-    if (phase === 'thinking' && prev === 'transcribing') {
-      if ($caption.get()) showGhostWords($caption.get(), 'you', { sticky: false })
-    }
-    // Do not wipe words the instant listening restarts — let hold/fade handle it
   }
 }
 
@@ -442,11 +472,11 @@ function ensureCss() {
     document.head.appendChild(el)
   }
   el.textContent = `
-/* Hide stock voice strip while in-chat Live is up */
+/* Hide stock voice status strip only */
 [data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
   display: none !important;
 }
-/* Keep chat readable — no full-desktop dim */
+/* Transcript stays primary — no dim, no blur, no full cover */
 [data-voice-hud-live="1"] [data-slot="messages"],
 [data-voice-hud-live="1"] [data-slot="thread"],
 [data-voice-hud-live="1"] [data-slot="chat-scroll"] {
@@ -454,59 +484,69 @@ function ensureCss() {
   filter: none !important;
   pointer-events: auto !important;
 }
-/* In-chat Live card (composer.top) */
-[data-voice-hud="1"].vh-inchat {
+/* Floating orb dock above composer — ChatGPT desktop Voice pattern */
+[data-voice-hud="1"].vh-float {
   position: relative;
-  z-index: 5;
-  width: 100%;
-  margin: 0 0 0.45rem 0;
-  padding: 0.75rem 0.9rem 0.9rem;
-  border-radius: 1rem;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  background:
-    radial-gradient(ellipse 80% 90% at 50% 35%, rgba(56, 120, 220, 0.14), transparent 62%),
-    rgba(10, 14, 22, 0.94);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 6px 22px rgba(0,0,0,0.22);
-  color: #e2e8f0;
-  overflow: hidden;
-}
-[data-voice-hud="1"].vh-inchat .vh-top {
+  z-index: 6;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.15rem;
+  justify-content: center;
+  width: 100%;
+  margin: 0 0 0.35rem 0;
+  padding: 0.35rem 0.5rem 0.55rem;
+  border: none;
+  background: transparent;
+  pointer-events: none;
 }
-[data-voice-hud="1"].vh-inchat .vh-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.78rem;
-  font-weight: 600;
-  color: #f1f5f9;
+[data-voice-hud="1"].vh-float > * {
+  pointer-events: auto;
 }
-[data-voice-hud="1"].vh-inchat .vh-dot {
-  width: 0.42rem;
-  height: 0.42rem;
-  border-radius: 999px;
-  background: #22c55e;
-  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.16);
-}
-[data-voice-hud="1"].vh-inchat .vh-dot[data-on="speak"] {
-  background: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
-}
-[data-voice-hud="1"].vh-inchat .vh-dot[data-on="think"] {
-  background: #f59e0b;
-  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.16);
-}
-[data-voice-hud="1"].vh-inchat .vh-words {
-  min-height: 2.6rem;
+[data-voice-hud="1"] .vh-caption {
+  max-width: min(36rem, 92%);
+  margin: 0 auto 0.35rem;
   text-align: center;
+  min-height: 1.4rem;
   transition: opacity 0.35s ease;
 }
-/* Kill legacy full-desktop portal if hot-reload left one */
-#${LEGACY_PORTAL_ID} { display: none !important; visibility: hidden !important; pointer-events: none !important; }
+[data-voice-hud="1"] .vh-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.85rem;
+  margin-top: 0.15rem;
+}
+[data-voice-hud="1"] .vh-ctrl {
+  width: 2.35rem;
+  height: 2.35rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 18, 28, 0.55);
+  color: rgba(226, 232, 240, 0.92);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+[data-voice-hud="1"] .vh-ctrl:hover {
+  background: rgba(30, 41, 59, 0.75);
+  border-color: rgba(148, 163, 184, 0.28);
+}
+[data-voice-hud="1"] .vh-ctrl[data-on="1"] {
+  opacity: 0.45;
+  border-color: rgba(248, 113, 113, 0.35);
+}
+[data-voice-hud="1"] .vh-ctrl.vh-end {
+  color: rgba(252, 165, 165, 0.95);
+}
+#${LEGACY_PORTAL_ID} {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
 `
 }
 
@@ -533,16 +573,14 @@ function wireGateway() {
     } else if (type === 'message.complete') {
       if ($agentLine.get()) showGhostWords($agentLine.get().slice(-240), 'agent', { sticky: false })
       $agentLine.set('')
-      if (findCoreEndButton() || $nativeActive.get()) {
-        $phase.set('listening')
-      }
+      if (findCoreEndButton() || $nativeActive.get()) $phase.set('listening')
     }
   })
 }
 
-// --- Soft Live orb (in-chat scale) -------------------------------------------
+// --- Soft orb (ChatGPT desktop scale) ---------------------------------------
 
-function VoiceOrb({ size = 96 }) {
+function VoiceOrb({ size = 72 }) {
   const ref = useRef(null)
   const level = useValue($level)
   const phase = useValue($phase)
@@ -559,7 +597,7 @@ function VoiceOrb({ size = 96 }) {
     let raf = 0
     const t0 = performance.now()
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
-    const pad = Math.round(size * 0.5)
+    const pad = Math.round(size * 0.42)
     const W = size + pad * 2
     c.width = Math.round(W * dpr)
     c.height = Math.round(W * dpr)
@@ -574,63 +612,56 @@ function VoiceOrb({ size = 96 }) {
       const ph = pr.current
       const lv = Math.max(0, Math.min(1, lr.current))
 
-      let energy = 0.22
+      let energy = 0.2
       let speed = 1.0
       if (ph === 'listening' || ph === 'recording') {
-        energy = 0.38 + lv * 0.5
-        speed = 1.12
+        energy = 0.34 + lv * 0.5
+        speed = 1.1
       } else if (ph === 'transcribing' || ph === 'thinking') {
-        energy = 0.3
-        speed = 1.45
+        energy = 0.28
+        speed = 1.4
       } else if (ph === 'speaking') {
-        energy = 0.52 + lv * 0.38
-        speed = 1.22
+        energy = 0.5 + lv * 0.35
+        speed = 1.2
       }
 
-      const breathe = 1 + Math.sin(t * 2.0 * speed) * (0.03 + energy * 0.025)
+      const breathe = 1 + Math.sin(t * 2.05 * speed) * (0.028 + energy * 0.022)
       const R = size * 0.5 * breathe
       ctx.clearRect(0, 0, W, W)
 
-      for (let i = 0; i < 4; i++) {
-        const phaseOff = (t * speed * 0.35 + i / 4) % 1
-        const rr = R * (1.12 + phaseOff * (1.55 + energy * 0.45))
-        const alpha = (1 - phaseOff) * (0.1 + energy * 0.14)
-        ctx.beginPath()
-        ctx.arc(cx, cy, rr, 0, Math.PI * 2)
-        ctx.strokeStyle = `rgba(125, 180, 255, ${alpha})`
-        ctx.lineWidth = 1.2 + (1 - phaseOff) * 1.2
-        ctx.stroke()
-      }
-
-      const bloom = ctx.createRadialGradient(cx, cy, R * 0.25, cx, cy, R * 1.45)
-      bloom.addColorStop(0, `rgba(120, 170, 255, ${0.28 + energy * 0.2})`)
-      bloom.addColorStop(0.55, `rgba(80, 130, 220, ${0.1 + energy * 0.08})`)
-      bloom.addColorStop(1, 'rgba(40, 80, 160, 0)')
-      ctx.fillStyle = bloom
+      // Soft outer wash (like the product shot glow)
+      const wash = ctx.createRadialGradient(cx, cy, R * 0.2, cx, cy, R * 1.7)
+      wash.addColorStop(0, `rgba(180, 210, 255, ${0.22 + energy * 0.18})`)
+      wash.addColorStop(0.55, `rgba(140, 180, 255, ${0.08 + energy * 0.08})`)
+      wash.addColorStop(1, 'rgba(100, 140, 220, 0)')
+      ctx.fillStyle = wash
       ctx.beginPath()
-      ctx.arc(cx, cy, R * 1.45, 0, Math.PI * 2)
+      ctx.arc(cx, cy, R * 1.7, 0, Math.PI * 2)
       ctx.fill()
 
+      // Sphere — white → soft blue (ChatGPT Live)
       const body = ctx.createRadialGradient(
         cx - R * 0.22,
-        cy - R * 0.28,
-        R * 0.05,
-        cx,
-        cy + R * 0.08,
+        cy - R * 0.3,
+        R * 0.04,
+        cx + R * 0.05,
+        cy + R * 0.1,
         R
       )
-      body.addColorStop(0, 'rgba(240, 248, 255, 0.98)')
-      body.addColorStop(0.35, 'rgba(180, 210, 255, 0.92)')
-      body.addColorStop(0.72, `rgba(90, 140, 230, ${0.88 + energy * 0.05})`)
-      body.addColorStop(1, `rgba(40, 80, 160, ${0.55 + energy * 0.12})`)
+      body.addColorStop(0, 'rgba(255, 255, 255, 1)')
+      body.addColorStop(0.32, 'rgba(230, 240, 255, 0.98)')
+      body.addColorStop(0.62, 'rgba(170, 200, 255, 0.94)')
+      body.addColorStop(0.88, `rgba(120, 165, 245, ${0.9 + energy * 0.05})`)
+      body.addColorStop(1, `rgba(90, 140, 230, ${0.55 + energy * 0.12})`)
       ctx.fillStyle = body
       ctx.beginPath()
       ctx.arc(cx, cy, R, 0, Math.PI * 2)
       ctx.fill()
 
+      // Specular
       ctx.fillStyle = 'rgba(255,255,255,0.55)'
       ctx.beginPath()
-      ctx.ellipse(cx - R * 0.22, cy - R * 0.28, R * 0.16, R * 0.1, -0.5, 0, Math.PI * 2)
+      ctx.ellipse(cx - R * 0.2, cy - R * 0.26, R * 0.15, R * 0.09, -0.5, 0, Math.PI * 2)
       ctx.fill()
 
       raf = requestAnimationFrame(draw)
@@ -642,8 +673,75 @@ function VoiceOrb({ size = 96 }) {
   return jsx('canvas', {
     ref,
     'aria-hidden': true,
-    className: 'block mx-auto',
-    style: { filter: 'drop-shadow(0 6px 20px rgba(80,140,255,0.28))' }
+    className: 'block',
+    style: { filter: 'drop-shadow(0 8px 24px rgba(100,150,255,0.25))' }
+  })
+}
+
+function IconMic({ muted }) {
+  // Simple geometric icons (no external icon packs)
+  return jsx('svg', {
+    width: 16,
+    height: 16,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': 1.8,
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    children: muted
+      ? [
+          jsx('path', { d: 'M9 9v3a3 3 0 0 0 5.1 2.1', key: 'a' }),
+          jsx('path', { d: 'M15 9.3V5a3 3 0 0 0-5.8-1', key: 'b' }),
+          jsx('path', { d: 'M5 10v2a7 7 0 0 0 11 5.7', key: 'c' }),
+          jsx('path', { d: 'M19 10v2c0 .3 0 .7-.1 1', key: 'd' }),
+          jsx('line', { x1: 2, y1: 2, x2: 22, y2: 22, key: 'e' }),
+          jsx('line', { x1: 12, y1: 19, x2: 12, y2: 22, key: 'f' }),
+          jsx('line', { x1: 8, y1: 22, x2: 16, y2: 22, key: 'g' })
+        ]
+      : [
+          jsx('rect', { x: 9, y: 2, width: 6, height: 11, rx: 3, key: 'a' }),
+          jsx('path', { d: 'M5 10v2a7 7 0 0 0 14 0v-2', key: 'b' }),
+          jsx('line', { x1: 12, y1: 19, x2: 12, y2: 22, key: 'c' }),
+          jsx('line', { x1: 8, y1: 22, x2: 16, y2: 22, key: 'd' })
+        ]
+  })
+}
+
+function IconSpeaker({ muted }) {
+  return jsx('svg', {
+    width: 16,
+    height: 16,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': 1.8,
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    children: muted
+      ? [
+          jsx('polygon', { points: '11 5 6 9 2 9 2 15 6 15 11 19 11 5', key: 'a' }),
+          jsx('line', { x1: 23, y1: 9, x2: 17, y2: 15, key: 'b' }),
+          jsx('line', { x1: 17, y1: 9, x2: 23, y2: 15, key: 'c' })
+        ]
+      : [
+          jsx('polygon', { points: '11 5 6 9 2 9 2 15 6 15 11 19 11 5', key: 'a' }),
+          jsx('path', { d: 'M15.5 8.5a5 5 0 0 1 0 7', key: 'b' }),
+          jsx('path', { d: 'M18.5 5.5a9 9 0 0 1 0 13', key: 'c' })
+        ]
+  })
+}
+
+function IconClose() {
+  return jsx('svg', {
+    width: 15,
+    height: 15,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': 2,
+    'stroke-linecap': 'round',
+    children: [jsx('line', { x1: 18, y1: 6, x2: 6, y2: 18, key: 'a' }), jsx('line', { x1: 6, y1: 6, x2: 18, y2: 18, key: 'b' })]
   })
 }
 
@@ -657,6 +755,8 @@ function LiveStrip() {
   const error = useValue($error)
   const busOk = useValue($busOk)
   const elapsed = useValue($elapsed)
+  const micMuted = useValue($micMuted)
+  const speakerMuted = useValue($speakerMuted)
 
   useEffect(() => {
     killLegacyPortal()
@@ -675,91 +775,98 @@ function LiveStrip() {
 
   const listening = phase === 'listening' || phase === 'recording'
   const speaking = phase === 'speaking'
-  const thinking = phase === 'thinking' || phase === 'transcribing'
-  const orbSize = speaking ? 104 : listening ? 96 : 90
+  // ChatGPT desktop: modest orb above composer
+  const orbSize = speaking ? 78 : listening ? 72 : 68
 
   const showText = ghostText && ghostOpacity > 0.02 ? ghostText : (caption || '').trim()
   const showRole = ghostText && ghostOpacity > 0.02 ? ghostRole : showText ? 'you' : ''
   const showOp = ghostText && ghostOpacity > 0.02 ? ghostOpacity : showText ? 1 : 0
-  const dotOn = speaking ? 'speak' : thinking ? 'think' : 'listen'
 
   return jsxs('div', {
-    className: 'vh-inchat',
+    className: 'vh-float',
     role: 'status',
     'aria-live': 'polite',
     'data-voice-hud': '1',
     'data-vh-phase': phase,
     children: [
-      jsxs('div', {
-        className: 'vh-top',
-        children: [
-          jsxs('div', {
-            className: 'vh-pill',
-            children: [
-              jsx('span', { className: 'vh-dot', 'data-on': dotOn }),
-              jsx('span', { children: 'Live' }),
-              jsx('span', {
-                className: 'text-[0.72rem] font-normal text-slate-400',
-                children: phaseLabel(phase)
-              }),
-              jsx('span', {
-                className: 'font-mono text-[0.68rem] tabular-nums text-slate-500',
-                children: formatElapsed(elapsed / 1000)
-              })
-            ]
-          }),
-          jsx(Button, {
-            type: 'button',
-            size: 'sm',
-            variant: 'ghost',
-            className:
-              'h-7 shrink-0 rounded-full border border-white/10 px-3 text-[0.75rem] text-slate-200 hover:bg-white/10',
-            'aria-label': 'Stop voice HUD',
-            'data-voice-hud-end': '1',
-            onClick: e => {
-              e.preventDefault()
-              e.stopPropagation()
-              endVoice()
-            },
-            children: 'End'
-          })
-        ]
-      }),
+      // Light caption above orb (optional; transcript is the main page)
       jsx('div', {
-        className: 'flex justify-center py-0.5',
-        children: jsx(VoiceOrb, { size: orbSize })
-      }),
-      jsx('div', {
-        className: 'vh-words',
-        style: { opacity: showText && showOp > 0.02 ? showOp : listening ? 0.92 : 0.7 },
+        className: 'vh-caption',
+        style: { opacity: showText && showOp > 0.02 ? showOp : 0.55 },
         children:
           showText && showOp > 0.02
             ? jsxs('div', {
                 children: [
                   jsx('div', {
                     className: cn(
-                      'mb-1 text-[0.68rem] font-bold uppercase tracking-[0.16em]',
-                      showRole === 'agent' ? 'text-sky-300' : 'text-emerald-300'
+                      'mb-0.5 text-[0.62rem] font-semibold uppercase tracking-[0.14em]',
+                      showRole === 'agent' ? 'text-sky-300/90' : 'text-emerald-300/90'
                     ),
                     children: showRole === 'agent' ? 'ILO' : 'YOU'
                   }),
                   jsx('div', {
                     className: cn(
-                      'line-clamp-3 text-[1.08rem] font-medium leading-snug',
-                      showRole === 'agent' ? 'text-sky-50' : 'text-slate-50'
+                      'line-clamp-2 text-[0.92rem] font-medium leading-snug',
+                      showRole === 'agent' ? 'text-sky-50/95' : 'text-slate-100/95'
                     ),
                     children: showText
                   })
                 ]
               })
             : jsx('div', {
-                className: 'text-[0.92rem] font-medium text-slate-400',
+                className: 'text-[0.78rem] text-slate-400/90',
                 children: !busOk
-                  ? 'Starting Live…'
-                  : listening
-                    ? 'Listening — speak anytime'
-                    : phaseLabel(phase)
+                  ? 'Starting…'
+                  : `${phaseLabel(phase)} · ${formatElapsed(elapsed / 1000)}`
               })
+      }),
+
+      jsx(VoiceOrb, { size: orbSize }),
+
+      // Mic · Speaker · End  (ChatGPT pattern)
+      jsxs('div', {
+        className: 'vh-controls',
+        children: [
+          jsx('button', {
+            type: 'button',
+            className: 'vh-ctrl',
+            'data-on': micMuted ? '1' : '0',
+            'aria-label': micMuted ? 'Unmute microphone' : 'Mute microphone',
+            title: micMuted ? 'Unmute' : 'Mute mic',
+            onClick: e => {
+              e.preventDefault()
+              e.stopPropagation()
+              toggleMicMute()
+            },
+            children: jsx(IconMic, { muted: micMuted })
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'vh-ctrl',
+            'data-on': speakerMuted ? '1' : '0',
+            'aria-label': speakerMuted ? 'Unmute speaker' : 'Mute speaker',
+            title: speakerMuted ? 'Unmute speaker' : 'Mute speaker',
+            onClick: e => {
+              e.preventDefault()
+              e.stopPropagation()
+              toggleSpeakerMute()
+            },
+            children: jsx(IconSpeaker, { muted: speakerMuted })
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'vh-ctrl vh-end',
+            'aria-label': 'Stop voice HUD',
+            'data-voice-hud-end': '1',
+            title: 'End voice',
+            onClick: e => {
+              e.preventDefault()
+              e.stopPropagation()
+              endVoice()
+            },
+            children: jsx(IconClose, {})
+          })
+        ]
       })
     ]
   })
@@ -769,7 +876,7 @@ function StatusChip() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
   return jsx(Tip, {
-    content: active ? 'Live voice (in chat) — click to End' : 'Start Live voice in this chat',
+    content: active ? 'Voice Live in this chat — click to End' : 'Start Voice Live in this chat',
     children: jsx('button', {
       type: 'button',
       className: 'inline-flex',
@@ -777,7 +884,7 @@ function StatusChip() {
       children: jsx(Badge, {
         variant: active ? 'default' : 'outline',
         className: 'cursor-pointer gap-1 font-normal',
-        children: active ? `Live · ${phase}` : 'Live'
+        children: active ? `Voice · ${phase}` : 'Voice'
       })
     })
   })
@@ -814,7 +921,7 @@ export default {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
           label: 'Voice HUD: Toggle Live (in chat)',
-          keywords: ['voice', 'hud', 'live', 'orb'],
+          keywords: ['voice', 'hud', 'live', 'orb', 'chatgpt'],
           run: () => toggleVoice()
         }
       },
@@ -823,7 +930,7 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'voice-hud.end',
-          label: 'Voice HUD: End Live',
+          label: 'Voice HUD: End',
           keywords: ['voice', 'end', 'stop'],
           run: () => endVoice()
         }

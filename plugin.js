@@ -1,16 +1,23 @@
 /**
- * voice-hud — live status skin over Hermes Desktop native voice.
+ * voice-hud — live caption skin over Hermes Desktop native voice.
  *
- * CRITICAL bugs fixed:
- *  1) findEndButton must NEVER match the HUD End control
- *     (aria-label "End …" was matching → clickCoreEnd clicked ourselves → open/close loop)
- *  2) No getUserMedia / MediaRecorder / Web Speech while core listens
- *     (second capture kills continuous re-arm after turn 1)
+ * Goals:
+ *  • Real-time YOU caption while speaking (Web Speech interim)
+ *  • Continuous native conversation (core owns VAD/STT/loop)
+ *  • No chat-history replay in the dock
+ *  • End/Stop never self-clicks into an open/close loop
  *
- * Live feedback without second mic:
- *  • Phase + core ConversationIndicator level bars
- *  • After Desktop STT commits, show last utterance once (single line, not chat replay)
- *  • Agent current stream line only (not history)
+ * Mic contract:
+ *  • Never getUserMedia / MediaRecorder (core exclusive for VAD)
+ *  • Web Speech ONLY in phase === 'listening'
+ *  • Delayed start (~350ms) so core opens the mic first
+ *  • Hard-abort the instant phase leaves listening (before core STT/re-arm)
+ *  • Generation token so aborted sessions cannot write captions
+ *
+ * End contract:
+ *  • findCoreEndButton matches ONLY core "End voice conversation"
+ *  • Never matches HUD Stop (data-voice-hud / data-voice-hud-end)
+ *  • endVoice never dispatchVoiceToggle (toggle would START a new session)
  *
  * Opt-in: defaultEnabled false. Imports: @hermes/plugin-sdk + react* only.
  */
@@ -35,29 +42,38 @@ const PLUGIN_ID = 'voice-hud'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
 const STYLE_ID = 'voice-hud-css'
 const END_MISS_TOLERANCE = 5
-/** Core ConversationPill End — must not match HUD controls. */
 const CORE_END_RE = /end voice conversation/i
+/** Let core claim the mic before Web Speech attaches. */
+const CAPTION_START_DELAY_MS = 350
 
 /** @typedef {'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'} Phase */
 
 const $nativeActive = atom(false)
 const $phase = atom(/** @type {Phase} */ ('idle'))
 const $level = atom(0)
-/** Last committed user utterance (one line). Not a chat log. */
+/** Live interim words while you speak. */
+const $liveCaption = atom('')
+/** Fallback: last committed user bubble after Desktop STT (one line). */
 const $lastSaid = atom('')
-/** Current agent stream only. */
 const $agentLine = atom('')
 const $elapsed = atom(0)
 const $error = atom('')
+/** live | unavailable | off */
+const $captionMode = atom(/** @type {'live' | 'unavailable' | 'off'} */ ('off'))
 
 let pollTimer = 0
 let endWatch = 0
 let elapsedTimer = 0
+let captionStartTimer = 0
 let startedAt = 0
 let endMisses = 0
 let lastBubbleSeen = ''
-/** Prevent re-entrant end clicks. */
 let ending = false
+let speechWanted = false
+let speechGen = 0
+/** @type {null | { abort: () => void, gen: number }} */
+let speechHandle = null
+let committedFinals = ''
 
 function formatElapsed(sec) {
   const s = Math.max(0, Math.floor(sec))
@@ -65,7 +81,9 @@ function formatElapsed(sec) {
 }
 
 function isHudNode(el) {
-  return Boolean(el?.closest?.('[data-voice-hud="1"]') || el?.getAttribute?.('data-voice-hud-end') === '1')
+  return Boolean(
+    el?.closest?.('[data-voice-hud="1"]') || el?.getAttribute?.('data-voice-hud-end') === '1'
+  )
 }
 
 function dispatchVoiceToggle() {
@@ -78,18 +96,15 @@ function dispatchVoiceToggle() {
   }
 }
 
-/**
- * ONLY the core ConversationPill End control.
- * Never our HUD button (data-voice-hud-end / inside data-voice-hud strip).
- */
+/** ONLY core ConversationPill End — never HUD Stop. */
 function findCoreEndButton() {
   if (typeof document === 'undefined') return null
   const roots = document.querySelectorAll(
     '[data-slot="composer-root"], [data-slot="composer-dock"], [data-slot="composer-fade"]'
   )
-  const scope = roots.length ? roots : [document]
+  const scopes = roots.length ? Array.from(roots) : [document]
 
-  for (const root of scope) {
+  for (const root of scopes) {
     const buttons = root.querySelectorAll?.('button') || []
     for (const btn of buttons) {
       if (isHudNode(btn)) continue
@@ -98,33 +113,16 @@ function findCoreEndButton() {
     }
   }
 
-  // Fallback: aria-label exactly-ish "End" short label on primary pill in controls
-  // only if it has the level bars (ConversationIndicator), not plain text End.
-  for (const root of scope) {
-    const buttons = root.querySelectorAll?.('button') || []
-    for (const btn of buttons) {
-      if (isHudNode(btn)) continue
-      const label = (btn.getAttribute('aria-label') || '').trim()
-      if (!/^end$/i.test(label) && !/end short/i.test(label)) {
-        // core endShort visible text is "End" but aria is endConversation full string
-        continue
-      }
-      if (btn.querySelector('span.flex.h-3, span[class*="h-3"]')) return btn
-    }
-  }
-
-  // Last resort: primary filled button containing visible "End" text + bars, outside HUD
-  for (const root of scope) {
+  // Fallback: primary pill with level bars + End text (outside HUD)
+  for (const root of scopes) {
     const buttons = root.querySelectorAll?.('button') || []
     for (const btn of buttons) {
       if (isHudNode(btn)) continue
       const text = (btn.textContent || '').replace(/\s+/g, ' ').trim()
-      if (!/^end$/i.test(text) && !/\bend\b/i.test(text)) continue
-      // Conversation pill End is bg-primary rounded-full with indicator
-      if (btn.querySelector('span.w-0\\.5, span[class*="w-0.5"], svg')) return btn
+      if (!/^end$/i.test(text)) continue
+      if (btn.querySelector('span.w-0\\.5, span[class*="w-0.5"]')) return btn
     }
   }
-
   return null
 }
 
@@ -168,14 +166,44 @@ function clearTimersSoft() {
     clearTimeout(endWatch)
     endWatch = 0
   }
+  if (captionStartTimer) {
+    clearTimeout(captionStartTimer)
+    captionStartTimer = 0
+  }
+}
+
+function stopLiveCaption(opts = {}) {
+  const keepText = Boolean(opts.keepText)
+  speechWanted = false
+  speechGen += 1
+  if (captionStartTimer) {
+    clearTimeout(captionStartTimer)
+    captionStartTimer = 0
+  }
+  const h = speechHandle
+  speechHandle = null
+  if (h) {
+    try {
+      h.abort()
+    } catch {
+      /* ignore */
+    }
+  }
+  committedFinals = ''
+  if (!keepText) {
+    // leave $liveCaption for freeze-after-take when keepText true
+  }
 }
 
 function resetSessionUi() {
+  stopLiveCaption()
   $phase.set('idle')
   $level.set(0)
   $elapsed.set(0)
+  $liveCaption.set('')
   $lastSaid.set('')
   $agentLine.set('')
+  $captionMode.set('off')
   lastBubbleSeen = ''
   endMisses = 0
   ending = false
@@ -197,35 +225,28 @@ function startElapsed() {
   }, 200)
 }
 
-/** User End — never toggle-start, never click ourselves. */
 function endVoice() {
   if (ending) return
   ending = true
   haptic('close')
   $error.set('')
-
-  const hadCore = Boolean(findCoreEndButton())
-  if (hadCore) clickCoreEnd()
-
-  // Tear down local UI immediately (don't wait for poll)
+  stopLiveCaption()
+  if (findCoreEndButton()) clickCoreEnd()
   $nativeActive.set(false)
   resetSessionUi()
-
-  // One delayed re-click ONLY if core pill still present (React lag)
   endWatch = window.setTimeout(() => {
     endWatch = 0
     ending = false
-    const still = findCoreEndButton()
-    if (still) clickCoreEnd()
+    if (findCoreEndButton()) clickCoreEnd()
   }, 300)
 }
 
 function startVoice() {
   if (ending) return
   $error.set('')
-  if (findCoreEndButton()) return
-  if ($nativeActive.get()) return
+  if (findCoreEndButton() || $nativeActive.get()) return
   haptic('open')
+  $liveCaption.set('')
   $lastSaid.set('')
   $agentLine.set('')
   lastBubbleSeen = ''
@@ -241,7 +262,146 @@ function toggleVoice() {
   } else startVoice()
 }
 
-// --- Observe core (no second capture) ----------------------------------------
+// --- Live caption (Web Speech, listening-only) --------------------------------
+
+function speechApiAvailable() {
+  return Boolean(
+    typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition)
+  )
+}
+
+function startLiveCaptionEngine() {
+  if (speechHandle || typeof window === 'undefined') return
+  if ($phase.get() !== 'listening' || !$nativeActive.get() || ending) return
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+  if (!SR) {
+    $captionMode.set('unavailable')
+    return
+  }
+
+  const gen = speechGen
+  speechWanted = true
+  committedFinals = ''
+  $captionMode.set('live')
+
+  try {
+    const rec = new SR()
+    rec.continuous = true
+    rec.interimResults = true
+    rec.maxAlternatives = 1
+    try {
+      rec.lang = navigator.language || 'en-US'
+    } catch {
+      /* ignore */
+    }
+
+    rec.onresult = event => {
+      if (gen !== speechGen || !speechWanted) return
+      if ($phase.get() !== 'listening') return
+      let interim = ''
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const r = event.results[i]
+        const t = (r[0]?.transcript || '').trim()
+        if (!t) continue
+        if (r.isFinal) committedFinals = (committedFinals + ' ' + t).trim()
+        else interim = interim ? `${interim} ${t}` : t
+      }
+      const live = `${committedFinals}${interim ? (committedFinals ? ' ' : '') + interim : ''}`.trim()
+      if (live) $liveCaption.set(live)
+    }
+
+    rec.onerror = e => {
+      if (gen !== speechGen) return
+      const code = e?.error || ''
+      // no-speech / aborted are normal; not-allowed / service-not-allowed = unavailable
+      if (code === 'not-allowed' || code === 'service-not-allowed' || code === 'network') {
+        $captionMode.set('unavailable')
+        speechWanted = false
+      }
+    }
+
+    rec.onend = () => {
+      if (speechHandle && speechHandle.gen === gen) speechHandle = null
+      // Soft restart ONLY while still listening (browsers stop continuous rec periodically)
+      if (
+        gen === speechGen &&
+        speechWanted &&
+        $phase.get() === 'listening' &&
+        $nativeActive.get() &&
+        !ending
+      ) {
+        window.setTimeout(() => {
+          if (
+            gen === speechGen &&
+            speechWanted &&
+            $phase.get() === 'listening' &&
+            !speechHandle &&
+            !ending
+          ) {
+            startLiveCaptionEngine()
+          }
+        }, 100)
+      }
+    }
+
+    speechHandle = {
+      gen,
+      abort: () => {
+        try {
+          rec.onresult = null
+          rec.onerror = null
+          rec.onend = null
+          rec.abort?.()
+          rec.stop?.()
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    rec.start()
+  } catch {
+    speechHandle = null
+    $captionMode.set('unavailable')
+  }
+}
+
+/** Arm caption when entering listening; hard-stop when leaving. */
+function syncCaptionToPhase(phase, prev) {
+  if (captionStartTimer) {
+    clearTimeout(captionStartTimer)
+    captionStartTimer = 0
+  }
+
+  if (phase === 'listening') {
+    // Fresh listen cycle
+    if (prev && prev !== 'listening') {
+      $liveCaption.set('')
+      committedFinals = ''
+    }
+    if (!speechApiAvailable()) {
+      $captionMode.set('unavailable')
+      return
+    }
+    // Delay so core getUserMedia wins the device first
+    if (!speechHandle) {
+      speechWanted = true
+      captionStartTimer = window.setTimeout(() => {
+        captionStartTimer = 0
+        if ($phase.get() === 'listening' && $nativeActive.get() && !ending) {
+          startLiveCaptionEngine()
+        }
+      }, CAPTION_START_DELAY_MS)
+    }
+  } else {
+    // Freeze last live words for "Got it" view; release mic path immediately
+    const freeze = $liveCaption.get()
+    stopLiveCaption({ keepText: true })
+    if (freeze) $liveCaption.set(freeze)
+  }
+}
+
+// --- Observe core ------------------------------------------------------------
 
 function scrapeCoreLevel(endBtn) {
   if (!endBtn) return null
@@ -297,23 +457,14 @@ function detectNative() {
   if (typeof document === 'undefined') {
     return { active: false, phase: /** @type {Phase} */ ('idle'), level: 0 }
   }
-
-  // Active iff CORE end pill exists — never HUD End
   const endBtn = findCoreEndButton()
   let active = Boolean(endBtn)
-
   if (!active) {
     endMisses += 1
-    if (endMisses < END_MISS_TOLERANCE && $nativeActive.get() && !ending) {
-      active = true
-    }
-  } else {
-    endMisses = 0
-  }
+    if (endMisses < END_MISS_TOLERANCE && $nativeActive.get() && !ending) active = true
+  } else endMisses = 0
 
-  if (!active) {
-    return { active: false, phase: /** @type {Phase} */ ('idle'), level: 0 }
-  }
+  if (!active) return { active: false, phase: /** @type {Phase} */ ('idle'), level: 0 }
 
   const phase = scrapePhaseFromDom(endBtn)
   const coreLevel = scrapeCoreLevel(endBtn)
@@ -325,11 +476,9 @@ function detectNative() {
         : phase === 'speaking'
           ? 0.45
           : 0.15
-
   return { active: true, phase, level }
 }
 
-/** One-shot last utterance after Desktop STT — not a chat log. */
 function scrapeLastUserBubble() {
   const nodes = document.querySelectorAll(
     '[data-role="user"], [data-message-role="user"], [data-slot*="user-message"]'
@@ -343,13 +492,14 @@ function maybeUpdateLastSaid() {
   if (!bubble || bubble === lastBubbleSeen) return
   lastBubbleSeen = bubble
   $lastSaid.set(bubble)
+  // If live caption empty, fill from committed STT
+  if (!$liveCaption.get()) $liveCaption.set(bubble)
 }
 
 function wireDomObserver() {
   if (pollTimer) return
   pollTimer = window.setInterval(() => {
     if (ending) return
-
     const { active, phase, level } = detectNative()
     const was = $nativeActive.get()
     $level.set(level)
@@ -358,11 +508,11 @@ function wireDomObserver() {
       $nativeActive.set(true)
       $error.set('')
       $agentLine.set('')
-      // keep lastSaid until new listen cycle clears it below
+      $liveCaption.set('')
       startElapsed()
       setLiveAttr(true)
       $phase.set(phase)
-      if (phase === 'listening') $lastSaid.set('')
+      syncCaptionToPhase(phase, 'idle')
     } else if (!active && was) {
       $nativeActive.set(false)
       resetSessionUi()
@@ -375,25 +525,27 @@ function wireDomObserver() {
     const prev = $phase.get()
     if (phase !== prev) {
       $phase.set(phase)
+      syncCaptionToPhase(phase, prev)
       if (phase === 'listening' && prev !== 'idle') {
-        // New listen cycle after a reply — clear prior caption
-        $lastSaid.set('')
         $agentLine.set('')
       }
+    } else if (phase === 'listening' && !speechHandle && speechWanted && !captionStartTimer) {
+      // Ensure engine stays up across soft stops
+      syncCaptionToPhase('listening', 'listening')
     }
 
-    // After STT, fill single "what you said" line (not continuous chat replay)
     if (phase === 'transcribing' || phase === 'thinking' || phase === 'speaking') {
       maybeUpdateLastSaid()
     }
 
     setLiveAttr(true)
-  }, 90)
+  }, 80)
 }
 
 function stopDomObserver() {
   if (pollTimer) clearInterval(pollTimer)
   pollTimer = 0
+  stopLiveCaption()
   clearTimersSoft()
   setLiveAttr(false)
 }
@@ -428,7 +580,6 @@ function wireGateway() {
   return host.onEvent('*', event => {
     if (!event || typeof event !== 'object') return
     if (!$nativeActive.get() && !findCoreEndButton()) return
-
     const type = event.type
     const payload = event.payload && typeof event.payload === 'object' ? event.payload : {}
     const sid = event.session_id || payload.session_id
@@ -439,17 +590,18 @@ function wireGateway() {
       $agentLine.set('')
       maybeUpdateLastSaid()
       $phase.set('thinking')
+      stopLiveCaption({ keepText: true })
     } else if (type === 'message.delta') {
       const chunk = String(payload.text || payload.delta || '')
       if (!chunk) return
       $agentLine.set(($agentLine.get() + chunk).slice(-280))
       $phase.set('speaking')
+      stopLiveCaption({ keepText: true })
     } else if (type === 'message.complete') {
       $agentLine.set('')
       if (findCoreEndButton() || $nativeActive.get()) {
         $phase.set('listening')
-        // ready for next speak — clear last said so UI says Listening
-        $lastSaid.set('')
+        syncCaptionToPhase('listening', 'speaking')
       }
     }
   })
@@ -535,11 +687,13 @@ function phaseLabel(p) {
 function LiveStrip() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
+  const liveCaption = useValue($liveCaption)
   const lastSaid = useValue($lastSaid)
   const agentLine = useValue($agentLine)
   const elapsed = useValue($elapsed)
   const error = useValue($error)
   const level = useValue($level)
+  const captionMode = useValue($captionMode)
 
   if (!active) {
     if (error) {
@@ -555,24 +709,33 @@ function LiveStrip() {
   const listening = phase === 'listening'
   const showAgent = phase === 'speaking' && agentLine
 
-  let mainLabel = 'You'
+  // Prefer live caption; else last STT line; never a multi-turn chat log
+  let mainLabel = 'YOU'
   let mainText = ''
   let mainLive = false
 
   if (listening) {
-    mainLabel = 'You'
-    mainText = 'Listening… speak anytime'
-    mainLive = true
+    mainLabel = 'YOU'
+    if (liveCaption) {
+      mainText = liveCaption
+      mainLive = true
+    } else if (captionMode === 'unavailable') {
+      mainText = 'Listening (live words unavailable here — Desktop STT still hears you)'
+      mainLive = true
+    } else {
+      mainText = 'Listening…'
+      mainLive = true
+    }
   } else if (phase === 'transcribing' || phase === 'thinking') {
-    mainLabel = 'You'
-    mainText = lastSaid || '…'
+    mainLabel = 'YOU'
+    mainText = liveCaption || lastSaid || '…'
     mainLive = false
   } else if (showAgent) {
-    mainLabel = 'Hermes'
+    mainLabel = 'HERMES'
     mainText = agentLine
     mainLive = true
   } else {
-    mainText = lastSaid || phaseLabel(phase)
+    mainText = liveCaption || lastSaid || phaseLabel(phase)
   }
 
   return jsxs('div', {
@@ -627,7 +790,11 @@ function LiveStrip() {
           jsx('span', {
             className: 'min-w-0 flex-1 truncate text-[0.62rem] text-muted-foreground/55',
             children: listening
-              ? 'Continuous · Desktop mic'
+              ? captionMode === 'live'
+                ? 'Live caption'
+                : captionMode === 'unavailable'
+                  ? 'Levels only'
+                  : 'Arming caption…'
               : phase === 'speaking'
                 ? 'Reply'
                 : 'Native voice'
@@ -638,7 +805,6 @@ function LiveStrip() {
             size: 'sm',
             variant: 'ghost',
             className: 'h-6 shrink-0 rounded-full px-2.5 text-[0.68rem]',
-            // Must NOT match findCoreEndButton selectors
             'aria-label': 'Stop voice HUD',
             'data-voice-hud-end': '1',
             onClick: e => {
@@ -653,29 +819,30 @@ function LiveStrip() {
 
       jsxs('div', {
         className: cn(
-          'min-h-[2.1rem] rounded-lg border px-2.5 py-1.5',
-          mainLabel === 'You'
+          'min-h-[2.25rem] rounded-lg border px-2.5 py-1.5',
+          mainLabel === 'YOU'
             ? 'border-(--ui-stroke-tertiary) bg-background/40'
             : 'border-primary/15 bg-primary/5'
         ),
         children: [
           jsxs('div', {
             className:
-              'mb-0.5 flex items-center gap-1.5 text-[0.55rem] font-medium uppercase tracking-[0.12em] text-(--ui-text-quaternary)',
+              'mb-0.5 flex items-center gap-1.5 text-[0.55rem] font-medium uppercase tracking-[0.14em] text-(--ui-text-quaternary)',
             children: [
               mainLabel,
               mainLive
                 ? jsx('span', {
                     className: 'normal-case tracking-normal text-primary',
-                    children: '· live'
+                    children: 'live'
                   })
                 : null
             ]
           }),
           jsx('div', {
             className: cn(
-              'text-[0.85rem] leading-snug text-foreground',
-              listening && 'text-muted-foreground/70'
+              'text-[0.9rem] leading-snug text-foreground',
+              mainLive && liveCaption && 'font-medium',
+              listening && !liveCaption && 'text-muted-foreground/70'
             ),
             children: mainText
           })
@@ -690,8 +857,8 @@ function StatusChip() {
   const phase = useValue($phase)
   return jsx(Tip, {
     label: active
-      ? 'Native voice live — click to Stop (will not restart)'
-      : 'Voice HUD skins Desktop continuous voice. Enable in Settings → Plugins.',
+      ? 'Native voice + live caption — click Stop (will not restart)'
+      : 'Voice HUD: live caption while you speak. Settings → Plugins.',
     children: jsx('button', {
       type: 'button',
       className: cn(
@@ -704,7 +871,7 @@ function StatusChip() {
       },
       children: jsx(Badge, {
         variant: active ? 'default' : 'muted',
-        children: active ? `hud · ${phase}` : 'hud'
+        children: active ? `hud ${phase}` : 'hud'
       })
     })
   })
@@ -739,7 +906,7 @@ export default {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
           label: 'Voice HUD: Toggle native voice',
-          keywords: ['voice', 'hud', 'continuous'],
+          keywords: ['voice', 'hud', 'caption', 'live'],
           run: () => toggleVoice()
         }
       },

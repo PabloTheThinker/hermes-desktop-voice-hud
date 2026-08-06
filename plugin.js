@@ -190,16 +190,23 @@ function endVoice() {
   finalizeRole('you')
   finalizeRole('hermes')
   $error.set('')
-  // Prefer End button — calls endConversation() (setActive false + conversation.end)
-  if (!clickCoreEnd()) dispatchVoiceToggle()
-  // Follow-up if React lagged
+  // IMPORTANT: never dispatchVoiceToggle when End is already gone — toggle
+  // would START a new conversation and look like an End loop.
+  const hadPill = Boolean(findEndButton())
+  if (hadPill) {
+    clickCoreEnd()
+  }
+  // Immediate local teardown so chip/strip don't stay "live" and re-fire End.
+  $nativeActive.set(false)
+  resetSessionUi()
   if (endWatch) clearTimeout(endWatch)
   endWatch = window.setTimeout(() => {
     endWatch = 0
+    // Only re-click core End if pill is STILL up (React lag). Never toggle.
     if (findEndButton()) {
       clickCoreEnd()
     }
-  }, 200)
+  }, 250)
 }
 
 function startVoice() {
@@ -213,8 +220,13 @@ function startVoice() {
 }
 
 function toggleVoice() {
-  if ($nativeActive.get() || findEndButton()) endVoice()
-  else startVoice()
+  // End only when a real ConversationPill is present; debounce-active alone
+  // must not call endVoice → blind toggle → restart loop.
+  if (findEndButton()) endVoice()
+  else if ($nativeActive.get()) {
+    $nativeActive.set(false)
+    resetSessionUi()
+  } else startVoice()
 }
 
 // --- Observe core (no capture devices) ---------------------------------------

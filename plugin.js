@@ -1,18 +1,18 @@
 /**
- * voice-hud — ChatGPT desktop Voice layout (in-session).
+ * voice-hud — clean Mac-style floating voice panel for Hermes Desktop.
  *
- * Reference (OpenAI desktop Voice / user shot):
- *  • Chat transcript stays fully visible (no full-desktop cover)
- *  • Soft blue–white orb floats above the composer
- *  • Minimal controls under orb: mic · speaker · End
- *  • Words optional / light — conversation is the page
+ * UX goals:
+ *  • Not glued into the chat composer strip
+ *  • Not a full-desktop takeover
+ *  • Polished floating sheet over the session workspace (macOS glass)
+ *  • Soft orb + mic / speaker / End
+ *  • Readable captions when present
  *
- * Native: hermes:voice-bus only. No second mic.
+ * Native: hermes:voice-bus. No second mic.
  * defaultEnabled: true. Imports: @hermes/plugin-sdk + react* only.
  */
 import {
   Badge,
-  Button,
   COMPOSER_AREAS,
   KEYBINDS_AREA,
   PALETTE_AREA,
@@ -31,12 +31,12 @@ const PLUGIN_ID = 'voice-hud'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
 const VOICE_BUS_EVENT = 'hermes:voice-bus'
 const STYLE_ID = 'voice-hud-css'
+const PANEL_ID = 'voice-hud-mac-panel'
 const END_MISS_TOLERANCE = 12
 const CORE_END_RE = /end voice conversation/i
 const WORD_HOLD_MS = 5500
 const WORD_FADE_MS = 1200
 const SESSION_HOLD_MS = 2500
-const LEGACY_PORTAL_ID = 'voice-hud-live-portal'
 
 /** @typedef {'idle' | 'listening' | 'recording' | 'transcribing' | 'thinking' | 'speaking'} Phase */
 
@@ -44,7 +44,6 @@ const $nativeActive = atom(false)
 const $phase = atom(/** @type {Phase} */ ('idle'))
 const $level = atom(0)
 const $caption = atom('')
-const $captionPartial = atom(false)
 const $agentLine = atom('')
 const $elapsed = atom(0)
 const $error = atom('')
@@ -61,12 +60,17 @@ let endWatch = 0
 let elapsedTimer = 0
 let fadeTimer = 0
 let fadeRaf = 0
+let layoutTimer = 0
+let orbRaf = 0
 let startedAt = 0
 let endMisses = 0
 let ending = false
 /** @type {null | ((e: Event) => void)} */
 let busListener = null
 let lastGhostKey = ''
+/** @type {HTMLCanvasElement | null} */
+let orbCanvas = null
+let orbT0 = 0
 
 function formatElapsed(sec) {
   const s = Math.max(0, Math.floor(sec))
@@ -78,12 +82,14 @@ function phaseLabel(p) {
   if (p === 'transcribing') return 'Got it'
   if (p === 'thinking') return 'Thinking'
   if (p === 'speaking') return 'Speaking'
-  return 'Live'
+  return 'Voice'
 }
 
 function isHudNode(el) {
   return Boolean(
-    el?.closest?.('[data-voice-hud="1"]') || el?.getAttribute?.('data-voice-hud-end') === '1'
+    el?.closest?.('[data-voice-hud="1"]') ||
+      el?.getAttribute?.('data-voice-hud-end') === '1' ||
+      el?.id === PANEL_ID
   )
 }
 
@@ -170,6 +176,10 @@ function clearTimersSoft() {
     clearTimeout(endWatch)
     endWatch = 0
   }
+  if (layoutTimer) {
+    clearInterval(layoutTimer)
+    layoutTimer = 0
+  }
   clearFadeTimers()
 }
 
@@ -191,22 +201,18 @@ function showGhostWords(text, role, opts = {}) {
   if (!t) return
   const key = `${role}:${t}`
   const sticky = Boolean(opts.sticky)
-
   if (key === lastGhostKey && sticky) {
     $ghostOpacity.set(1)
     scheduleFade(true)
+    paintPanel()
     return
   }
-  if (key === lastGhostKey && !sticky && $ghostOpacity.get() > 0.5) {
-    scheduleFade(false)
-    return
-  }
-
   lastGhostKey = key
   $ghostText.set(t)
   $ghostRole.set(role)
   $ghostOpacity.set(1)
   scheduleFade(sticky)
+  paintPanel()
 }
 
 function scheduleFade(extendOnly) {
@@ -219,26 +225,21 @@ function scheduleFade(extendOnly) {
     const tick = now => {
       const u = Math.min(1, (now - start) / WORD_FADE_MS)
       $ghostOpacity.set(from * (1 - u))
-      if (u < 1 && lastGhostKey) {
-        fadeRaf = requestAnimationFrame(tick)
-      } else {
+      paintPanel()
+      if (u < 1 && lastGhostKey) fadeRaf = requestAnimationFrame(tick)
+      else {
         fadeRaf = 0
         if (u >= 1) {
           $ghostText.set('')
           $ghostRole.set('')
           $ghostOpacity.set(0)
           lastGhostKey = ''
+          paintPanel()
         }
       }
     }
     fadeRaf = requestAnimationFrame(tick)
   }, hold)
-}
-
-function killLegacyPortal() {
-  if (typeof document === 'undefined') return
-  document.getElementById(LEGACY_PORTAL_ID)?.remove()
-  document.documentElement.removeAttribute('data-voice-hud-live')
 }
 
 function setLiveAttr(on) {
@@ -247,8 +248,12 @@ function setLiveAttr(on) {
     if (on) n.setAttribute('data-voice-hud-live', '1')
     else n.removeAttribute('data-voice-hud-live')
   })
-  killLegacyPortal()
+  document.documentElement.removeAttribute('data-voice-hud-live')
+  // Remove any old full-screen portal ids
+  document.getElementById('voice-hud-live-portal')?.remove()
   ensureCss()
+  if (on) mountPanel()
+  else unmountPanel()
 }
 
 function resetSessionUi() {
@@ -256,7 +261,6 @@ function resetSessionUi() {
   $level.set(0)
   $elapsed.set(0)
   $caption.set('')
-  $captionPartial.set(false)
   $agentLine.set('')
   $mode.set('off')
   $micMuted.set(false)
@@ -279,7 +283,8 @@ function startElapsed() {
       return
     }
     $elapsed.set(performance.now() - startedAt)
-  }, 200)
+    paintPanel()
+  }, 250)
 }
 
 function endVoice() {
@@ -318,15 +323,14 @@ function toggleVoice() {
 }
 
 function toggleMicMute() {
-  const next = !$micMuted.get()
-  $micMuted.set(next)
+  $micMuted.set(!$micMuted.get())
   haptic('tap')
-  // Best-effort: click core mute if present
+  paintPanel()
   try {
     const btn = [...document.querySelectorAll('[data-slot="composer-root"] button, [data-slot="composer-dock"] button')].find(
-      b => /mute|unmute/i.test(b.getAttribute('aria-label') || '')
+      b => /mute|unmute/i.test(b.getAttribute('aria-label') || '') && !isHudNode(b)
     )
-    if (btn && !isHudNode(btn)) btn.click()
+    if (btn) btn.click()
   } catch {
     /* ignore */
   }
@@ -335,7 +339,7 @@ function toggleMicMute() {
 function toggleSpeakerMute() {
   $speakerMuted.set(!$speakerMuted.get())
   haptic('tap')
-  // Pause any playing media elements as a soft mute fallback
+  paintPanel()
   try {
     if ($speakerMuted.get()) {
       document.querySelectorAll('audio, video').forEach(el => {
@@ -361,7 +365,6 @@ function onVoiceBus(ev) {
   const mode = d.mode || 'off'
   const phase = d.phase || 'idle'
   const active = Boolean(d.active && mode !== 'off')
-
   $mode.set(mode === 'dictation' || mode === 'conversation' ? mode : 'off')
 
   if (typeof d.level === 'number' && Number.isFinite(d.level)) {
@@ -371,7 +374,6 @@ function onVoiceBus(ev) {
   if (typeof d.caption === 'string' && d.caption.trim()) {
     const cap = d.caption.trim()
     $caption.set(cap)
-    $captionPartial.set(Boolean(d.partial))
     showGhostWords(cap, 'you', {
       sticky: Boolean(d.partial) || phase === 'listening' || phase === 'recording'
     })
@@ -383,7 +385,6 @@ function onVoiceBus(ev) {
     startElapsed()
     setLiveAttr(true)
   }
-
   if (!active && $nativeActive.get() && !findCoreEndButton()) return
 
   if (active) {
@@ -399,6 +400,7 @@ function onVoiceBus(ev) {
     ) {
       $phase.set(phase === 'idle' ? 'listening' : phase)
     }
+    paintPanel()
   }
 }
 
@@ -419,7 +421,6 @@ function wireDomFallback() {
   let lastSeenLive = 0
   pollTimer = window.setInterval(() => {
     if (ending) return
-    killLegacyPortal()
     const endBtn = findCoreEndButton()
     const busAlive = $busOk.get() && $mode.get() !== 'off'
     if (endBtn || busAlive) {
@@ -444,6 +445,7 @@ function wireDomFallback() {
           }
         }
       }
+      paintPanel()
     } else if ($nativeActive.get()) {
       endMisses += 1
       if (
@@ -463,93 +465,6 @@ function stopDomFallback() {
   pollTimer = 0
 }
 
-function ensureCss() {
-  if (typeof document === 'undefined') return
-  let el = document.getElementById(STYLE_ID)
-  if (!el) {
-    el = document.createElement('style')
-    el.id = STYLE_ID
-    document.head.appendChild(el)
-  }
-  el.textContent = `
-/* Hide stock voice status strip only */
-[data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
-  display: none !important;
-}
-/* Transcript stays primary — no dim, no blur, no full cover */
-[data-voice-hud-live="1"] [data-slot="messages"],
-[data-voice-hud-live="1"] [data-slot="thread"],
-[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
-  opacity: 1 !important;
-  filter: none !important;
-  pointer-events: auto !important;
-}
-/* Floating orb dock above composer — ChatGPT desktop Voice pattern */
-[data-voice-hud="1"].vh-float {
-  position: relative;
-  z-index: 6;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  margin: 0 0 0.35rem 0;
-  padding: 0.35rem 0.5rem 0.55rem;
-  border: none;
-  background: transparent;
-  pointer-events: none;
-}
-[data-voice-hud="1"].vh-float > * {
-  pointer-events: auto;
-}
-[data-voice-hud="1"] .vh-caption {
-  max-width: min(36rem, 92%);
-  margin: 0 auto 0.35rem;
-  text-align: center;
-  min-height: 1.4rem;
-  transition: opacity 0.35s ease;
-}
-[data-voice-hud="1"] .vh-controls {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.85rem;
-  margin-top: 0.15rem;
-}
-[data-voice-hud="1"] .vh-ctrl {
-  width: 2.35rem;
-  height: 2.35rem;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  background: rgba(15, 18, 28, 0.55);
-  color: rgba(226, 232, 240, 0.92);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
-}
-[data-voice-hud="1"] .vh-ctrl:hover {
-  background: rgba(30, 41, 59, 0.75);
-  border-color: rgba(148, 163, 184, 0.28);
-}
-[data-voice-hud="1"] .vh-ctrl[data-on="1"] {
-  opacity: 0.45;
-  border-color: rgba(248, 113, 113, 0.35);
-}
-[data-voice-hud="1"] .vh-ctrl.vh-end {
-  color: rgba(252, 165, 165, 0.95);
-}
-#${LEGACY_PORTAL_ID} {
-  display: none !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-}
-`
-}
-
 function wireGateway() {
   return host.onEvent('*', event => {
     if (!event || typeof event !== 'object') return
@@ -563,6 +478,7 @@ function wireGateway() {
     if (type === 'message.start') {
       $agentLine.set('')
       $phase.set('thinking')
+      paintPanel()
     } else if (type === 'message.delta') {
       const chunk = String(payload.text || payload.delta || '')
       if (!chunk) return
@@ -574,309 +490,463 @@ function wireGateway() {
       if ($agentLine.get()) showGhostWords($agentLine.get().slice(-240), 'agent', { sticky: false })
       $agentLine.set('')
       if (findCoreEndButton() || $nativeActive.get()) $phase.set('listening')
+      paintPanel()
     }
   })
 }
 
-// --- Soft orb (ChatGPT desktop scale) ---------------------------------------
+// --- Mac floating panel -----------------------------------------------------
 
-function VoiceOrb({ size = 72 }) {
-  const ref = useRef(null)
-  const level = useValue($level)
-  const phase = useValue($phase)
-  const lr = useRef(level)
-  const pr = useRef(phase)
-  lr.current = level
-  pr.current = phase
-
-  useEffect(() => {
-    const c = ref.current
-    if (!c) return
-    const ctx = c.getContext('2d')
-    if (!ctx) return
-    let raf = 0
-    const t0 = performance.now()
-    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
-    const pad = Math.round(size * 0.42)
-    const W = size + pad * 2
-    c.width = Math.round(W * dpr)
-    c.height = Math.round(W * dpr)
-    c.style.width = W + 'px'
-    c.style.height = W + 'px'
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-
-    const draw = now => {
-      const t = (now - t0) / 1000
-      const cx = W / 2
-      const cy = W / 2
-      const ph = pr.current
-      const lv = Math.max(0, Math.min(1, lr.current))
-
-      let energy = 0.2
-      let speed = 1.0
-      if (ph === 'listening' || ph === 'recording') {
-        energy = 0.34 + lv * 0.5
-        speed = 1.1
-      } else if (ph === 'transcribing' || ph === 'thinking') {
-        energy = 0.28
-        speed = 1.4
-      } else if (ph === 'speaking') {
-        energy = 0.5 + lv * 0.35
-        speed = 1.2
-      }
-
-      const breathe = 1 + Math.sin(t * 2.05 * speed) * (0.028 + energy * 0.022)
-      const R = size * 0.5 * breathe
-      ctx.clearRect(0, 0, W, W)
-
-      // Soft outer wash (like the product shot glow)
-      const wash = ctx.createRadialGradient(cx, cy, R * 0.2, cx, cy, R * 1.7)
-      wash.addColorStop(0, `rgba(180, 210, 255, ${0.22 + energy * 0.18})`)
-      wash.addColorStop(0.55, `rgba(140, 180, 255, ${0.08 + energy * 0.08})`)
-      wash.addColorStop(1, 'rgba(100, 140, 220, 0)')
-      ctx.fillStyle = wash
-      ctx.beginPath()
-      ctx.arc(cx, cy, R * 1.7, 0, Math.PI * 2)
-      ctx.fill()
-
-      // Sphere — white → soft blue (ChatGPT Live)
-      const body = ctx.createRadialGradient(
-        cx - R * 0.22,
-        cy - R * 0.3,
-        R * 0.04,
-        cx + R * 0.05,
-        cy + R * 0.1,
-        R
-      )
-      body.addColorStop(0, 'rgba(255, 255, 255, 1)')
-      body.addColorStop(0.32, 'rgba(230, 240, 255, 0.98)')
-      body.addColorStop(0.62, 'rgba(170, 200, 255, 0.94)')
-      body.addColorStop(0.88, `rgba(120, 165, 245, ${0.9 + energy * 0.05})`)
-      body.addColorStop(1, `rgba(90, 140, 230, ${0.55 + energy * 0.12})`)
-      ctx.fillStyle = body
-      ctx.beginPath()
-      ctx.arc(cx, cy, R, 0, Math.PI * 2)
-      ctx.fill()
-
-      // Specular
-      ctx.fillStyle = 'rgba(255,255,255,0.55)'
-      ctx.beginPath()
-      ctx.ellipse(cx - R * 0.2, cy - R * 0.26, R * 0.15, R * 0.09, -0.5, 0, Math.PI * 2)
-      ctx.fill()
-
-      raf = requestAnimationFrame(draw)
-    }
-    raf = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(raf)
-  }, [size])
-
-  return jsx('canvas', {
-    ref,
-    'aria-hidden': true,
-    className: 'block',
-    style: { filter: 'drop-shadow(0 8px 24px rgba(100,150,255,0.25))' }
-  })
-}
-
-function IconMic({ muted }) {
-  // Simple geometric icons (no external icon packs)
-  return jsx('svg', {
-    width: 16,
-    height: 16,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': 1.8,
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    children: muted
-      ? [
-          jsx('path', { d: 'M9 9v3a3 3 0 0 0 5.1 2.1', key: 'a' }),
-          jsx('path', { d: 'M15 9.3V5a3 3 0 0 0-5.8-1', key: 'b' }),
-          jsx('path', { d: 'M5 10v2a7 7 0 0 0 11 5.7', key: 'c' }),
-          jsx('path', { d: 'M19 10v2c0 .3 0 .7-.1 1', key: 'd' }),
-          jsx('line', { x1: 2, y1: 2, x2: 22, y2: 22, key: 'e' }),
-          jsx('line', { x1: 12, y1: 19, x2: 12, y2: 22, key: 'f' }),
-          jsx('line', { x1: 8, y1: 22, x2: 16, y2: 22, key: 'g' })
-        ]
-      : [
-          jsx('rect', { x: 9, y: 2, width: 6, height: 11, rx: 3, key: 'a' }),
-          jsx('path', { d: 'M5 10v2a7 7 0 0 0 14 0v-2', key: 'b' }),
-          jsx('line', { x1: 12, y1: 19, x2: 12, y2: 22, key: 'c' }),
-          jsx('line', { x1: 8, y1: 22, x2: 16, y2: 22, key: 'd' })
-        ]
-  })
-}
-
-function IconSpeaker({ muted }) {
-  return jsx('svg', {
-    width: 16,
-    height: 16,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': 1.8,
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    children: muted
-      ? [
-          jsx('polygon', { points: '11 5 6 9 2 9 2 15 6 15 11 19 11 5', key: 'a' }),
-          jsx('line', { x1: 23, y1: 9, x2: 17, y2: 15, key: 'b' }),
-          jsx('line', { x1: 17, y1: 9, x2: 23, y2: 15, key: 'c' })
-        ]
-      : [
-          jsx('polygon', { points: '11 5 6 9 2 9 2 15 6 15 11 19 11 5', key: 'a' }),
-          jsx('path', { d: 'M15.5 8.5a5 5 0 0 1 0 7', key: 'b' }),
-          jsx('path', { d: 'M18.5 5.5a9 9 0 0 1 0 13', key: 'c' })
-        ]
-  })
-}
-
-function IconClose() {
-  return jsx('svg', {
-    width: 15,
-    height: 15,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': 2,
-    'stroke-linecap': 'round',
-    children: [jsx('line', { x1: 18, y1: 6, x2: 6, y2: 18, key: 'a' }), jsx('line', { x1: 6, y1: 6, x2: 18, y2: 18, key: 'b' })]
-  })
-}
-
-function LiveStrip() {
-  const active = useValue($nativeActive)
-  const phase = useValue($phase)
-  const ghostText = useValue($ghostText)
-  const ghostRole = useValue($ghostRole)
-  const ghostOpacity = useValue($ghostOpacity)
-  const caption = useValue($caption)
-  const error = useValue($error)
-  const busOk = useValue($busOk)
-  const elapsed = useValue($elapsed)
-  const micMuted = useValue($micMuted)
-  const speakerMuted = useValue($speakerMuted)
-
-  useEffect(() => {
-    killLegacyPortal()
-  }, [active])
-
-  if (!active) {
-    if (error) {
-      return jsx('div', {
-        className:
-          'mb-1 rounded-lg border border-destructive/30 bg-destructive/10 px-2 py-1 text-[0.7rem] text-destructive',
-        children: error
-      })
-    }
-    return null
+function ensureCss() {
+  if (typeof document === 'undefined') return
+  let el = document.getElementById(STYLE_ID)
+  if (!el) {
+    el = document.createElement('style')
+    el.id = STYLE_ID
+    document.head.appendChild(el)
   }
+  el.textContent = `
+/* Hide only the stock voice status strip */
+[data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
+  display: none !important;
+}
+/* Leave chat fully readable */
+[data-voice-hud-live="1"] [data-slot="messages"],
+[data-voice-hud-live="1"] [data-slot="thread"],
+[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
+  opacity: 1 !important;
+  filter: none !important;
+  pointer-events: auto !important;
+}
 
+/* macOS-style floating voice sheet */
+#${PANEL_ID} {
+  position: fixed;
+  z-index: 80;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: min(320px, calc(100vw - 48px));
+  padding: 18px 20px 16px;
+  border-radius: 22px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background:
+    linear-gradient(180deg, rgba(40,44,54,0.72) 0%, rgba(22,24,30,0.78) 100%);
+  backdrop-filter: blur(28px) saturate(1.35);
+  -webkit-backdrop-filter: blur(28px) saturate(1.35);
+  box-shadow:
+    0 0 0 0.5px rgba(0,0,0,0.35),
+    0 18px 50px rgba(0,0,0,0.38),
+    0 2px 0 rgba(255,255,255,0.06) inset;
+  color: rgba(245,246,248,0.96);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  pointer-events: auto;
+  user-select: none;
+  animation: vh-mac-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes vh-mac-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+#${PANEL_ID} .vh-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: rgba(235,238,245,0.88);
+}
+#${PANEL_ID} .vh-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 99px;
+  background: #34c759;
+  box-shadow: 0 0 0 3px rgba(52,199,89,0.18);
+}
+#${PANEL_ID} .vh-dot[data-on="speak"] {
+  background: #0a84ff;
+  box-shadow: 0 0 0 3px rgba(10,132,255,0.2);
+}
+#${PANEL_ID} .vh-dot[data-on="think"] {
+  background: #ff9f0a;
+  box-shadow: 0 0 0 3px rgba(255,159,10,0.18);
+}
+#${PANEL_ID} .vh-sub {
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(174,178,188,0.9);
+  font-variant-numeric: tabular-nums;
+}
+#${PANEL_ID} .vh-orb-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 108px;
+}
+#${PANEL_ID} .vh-caption {
+  min-height: 2.4rem;
+  max-width: 100%;
+  text-align: center;
+  padding: 0 4px;
+}
+#${PANEL_ID} .vh-role {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+#${PANEL_ID} .vh-role.you { color: rgba(48, 209, 88, 0.95); }
+#${PANEL_ID} .vh-role.agent { color: rgba(100, 210, 255, 0.95); }
+#${PANEL_ID} .vh-text {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: -0.015em;
+  color: rgba(245,246,248,0.96);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+#${PANEL_ID} .vh-hint {
+  font-size: 12px;
+  font-weight: 500;
+  color: rgba(160,165,178,0.92);
+}
+#${PANEL_ID} .vh-ctrls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 2px;
+}
+#${PANEL_ID} .vh-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.07);
+  color: rgba(245,246,248,0.94);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 140ms ease, transform 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+#${PANEL_ID} .vh-btn:hover {
+  background: rgba(255,255,255,0.12);
+  border-color: rgba(255,255,255,0.16);
+}
+#${PANEL_ID} .vh-btn:active { transform: scale(0.96); }
+#${PANEL_ID} .vh-btn[data-on="1"] {
+  opacity: 0.45;
+  border-color: rgba(255,69,58,0.35);
+}
+#${PANEL_ID} .vh-btn.vh-end {
+  color: rgba(255,105,97,0.98);
+}
+/* Hide legacy portals */
+#voice-hud-live-portal { display: none !important; }
+`
+}
+
+function getWorkspaceRect() {
+  const sels = [
+    '[data-slot="workspace"]',
+    '[data-slot="chat-scroll"]',
+    '[data-slot="messages"]',
+    'main',
+    '[data-slot="composer-root"]'
+  ]
+  for (const s of sels) {
+    const el = document.querySelector(s)
+    if (!el) continue
+    const r = el.getBoundingClientRect()
+    if (r.width > 180 && r.height > 120) return r
+  }
+  return {
+    left: window.innerWidth * 0.2,
+    top: 0,
+    width: window.innerWidth * 0.6,
+    height: window.innerHeight,
+    right: window.innerWidth * 0.8,
+    bottom: window.innerHeight
+  }
+}
+
+function layoutPanel() {
+  const panel = document.getElementById(PANEL_ID)
+  if (!panel || !$nativeActive.get()) return
+  const r = getWorkspaceRect()
+  const pw = Math.min(320, Math.max(260, r.width * 0.42))
+  // Float lower-center of workspace (ChatGPT-like), Mac card polish
+  const left = r.left + (r.width - pw) / 2
+  const top = r.top + r.height * 0.58
+  panel.style.width = `${pw}px`
+  panel.style.left = `${Math.max(16, left)}px`
+  panel.style.top = `${Math.min(window.innerHeight - 220, Math.max(72, top))}px`
+}
+
+function svgMic(muted) {
+  if (muted) {
+    return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M9 9v3a3 3 0 005.1 2.1"/><path d="M15 9.3V5a3 3 0 00-5.8-1"/><path d="M5 10v2a7 7 0 0011 5.7"/><path d="M19 10v2c0 .3 0 .7-.1 1"/><line x1="2" y1="2" x2="22" y2="22"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>`
+  }
+  return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10v2a7 7 0 0014 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>`
+}
+
+function svgSpeaker(muted) {
+  if (muted) {
+    return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`
+  }
+  return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 010 7"/><path d="M18.5 5.5a9 9 0 010 13"/></svg>`
+}
+
+function svgClose() {
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function paintPanel() {
+  const panel = document.getElementById(PANEL_ID)
+  if (!panel || !$nativeActive.get()) return
+
+  const phase = $phase.get()
   const listening = phase === 'listening' || phase === 'recording'
   const speaking = phase === 'speaking'
-  // ChatGPT desktop: modest orb above composer
-  const orbSize = speaking ? 78 : listening ? 72 : 68
+  const thinking = phase === 'thinking' || phase === 'transcribing'
+  const dot = speaking ? 'speak' : thinking ? 'think' : 'listen'
 
-  const showText = ghostText && ghostOpacity > 0.02 ? ghostText : (caption || '').trim()
-  const showRole = ghostText && ghostOpacity > 0.02 ? ghostRole : showText ? 'you' : ''
-  const showOp = ghostText && ghostOpacity > 0.02 ? ghostOpacity : showText ? 1 : 0
+  const title = panel.querySelector('[data-vh-title]')
+  if (title) {
+    title.innerHTML = `<span class="vh-dot" data-on="${dot}"></span><span>Voice</span><span class="vh-sub">${phaseLabel(phase)} · ${formatElapsed($elapsed.get() / 1000)}</span>`
+  }
 
-  return jsxs('div', {
-    className: 'vh-float',
-    role: 'status',
-    'aria-live': 'polite',
-    'data-voice-hud': '1',
-    'data-vh-phase': phase,
-    children: [
-      // Light caption above orb (optional; transcript is the main page)
-      jsx('div', {
-        className: 'vh-caption',
-        style: { opacity: showText && showOp > 0.02 ? showOp : 0.55 },
-        children:
-          showText && showOp > 0.02
-            ? jsxs('div', {
-                children: [
-                  jsx('div', {
-                    className: cn(
-                      'mb-0.5 text-[0.62rem] font-semibold uppercase tracking-[0.14em]',
-                      showRole === 'agent' ? 'text-sky-300/90' : 'text-emerald-300/90'
-                    ),
-                    children: showRole === 'agent' ? 'ILO' : 'YOU'
-                  }),
-                  jsx('div', {
-                    className: cn(
-                      'line-clamp-2 text-[0.92rem] font-medium leading-snug',
-                      showRole === 'agent' ? 'text-sky-50/95' : 'text-slate-100/95'
-                    ),
-                    children: showText
-                  })
-                ]
-              })
-            : jsx('div', {
-                className: 'text-[0.78rem] text-slate-400/90',
-                children: !busOk
-                  ? 'Starting…'
-                  : `${phaseLabel(phase)} · ${formatElapsed(elapsed / 1000)}`
-              })
-      }),
+  const cap = panel.querySelector('[data-vh-caption]')
+  if (cap) {
+    const text = ($ghostText.get() || $caption.get() || '').trim()
+    const op = $ghostText.get() ? $ghostOpacity.get() : text ? 1 : 0
+    const role = $ghostText.get() ? $ghostRole.get() : text ? 'you' : ''
+    if (text && op > 0.05) {
+      cap.style.opacity = String(op)
+      cap.innerHTML = `<div class="vh-role ${role === 'agent' ? 'agent' : 'you'}">${role === 'agent' ? 'ILO' : 'YOU'}</div><div class="vh-text">${escapeHtml(text)}</div>`
+    } else {
+      cap.style.opacity = '0.9'
+      cap.innerHTML = `<div class="vh-hint">${
+        !$busOk.get() ? 'Starting…' : listening ? 'Listening — speak anytime' : phaseLabel(phase)
+      }</div>`
+    }
+  }
 
-      jsx(VoiceOrb, { size: orbSize }),
+  const mic = panel.querySelector('[data-vh-mic]')
+  const spk = panel.querySelector('[data-vh-spk]')
+  if (mic) {
+    mic.setAttribute('data-on', $micMuted.get() ? '1' : '0')
+    mic.innerHTML = svgMic($micMuted.get())
+  }
+  if (spk) {
+    spk.setAttribute('data-on', $speakerMuted.get() ? '1' : '0')
+    spk.innerHTML = svgSpeaker($speakerMuted.get())
+  }
+}
 
-      // Mic · Speaker · End  (ChatGPT pattern)
-      jsxs('div', {
-        className: 'vh-controls',
-        children: [
-          jsx('button', {
-            type: 'button',
-            className: 'vh-ctrl',
-            'data-on': micMuted ? '1' : '0',
-            'aria-label': micMuted ? 'Unmute microphone' : 'Mute microphone',
-            title: micMuted ? 'Unmute' : 'Mute mic',
-            onClick: e => {
-              e.preventDefault()
-              e.stopPropagation()
-              toggleMicMute()
-            },
-            children: jsx(IconMic, { muted: micMuted })
-          }),
-          jsx('button', {
-            type: 'button',
-            className: 'vh-ctrl',
-            'data-on': speakerMuted ? '1' : '0',
-            'aria-label': speakerMuted ? 'Unmute speaker' : 'Mute speaker',
-            title: speakerMuted ? 'Unmute speaker' : 'Mute speaker',
-            onClick: e => {
-              e.preventDefault()
-              e.stopPropagation()
-              toggleSpeakerMute()
-            },
-            children: jsx(IconSpeaker, { muted: speakerMuted })
-          }),
-          jsx('button', {
-            type: 'button',
-            className: 'vh-ctrl vh-end',
-            'aria-label': 'Stop voice HUD',
-            'data-voice-hud-end': '1',
-            title: 'End voice',
-            onClick: e => {
-              e.preventDefault()
-              e.stopPropagation()
-              endVoice()
-            },
-            children: jsx(IconClose, {})
-          })
-        ]
-      })
-    ]
-  })
+function startOrbLoop() {
+  if (orbRaf) cancelAnimationFrame(orbRaf)
+  orbT0 = performance.now()
+  const draw = now => {
+    const c = orbCanvas
+    const panel = document.getElementById(PANEL_ID)
+    if (!c || !panel || !$nativeActive.get()) {
+      orbRaf = 0
+      return
+    }
+    const ctx = c.getContext('2d')
+    if (!ctx) {
+      orbRaf = requestAnimationFrame(draw)
+      return
+    }
+
+    const phase = $phase.get()
+    const lv = Math.max(0, Math.min(1, $level.get()))
+    const speaking = phase === 'speaking'
+    const listening = phase === 'listening' || phase === 'recording'
+    const size = speaking ? 86 : listening ? 80 : 76
+    const pad = Math.round(size * 0.45)
+    const W = size + pad * 2
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
+    if (c.width !== Math.round(W * dpr)) {
+      c.width = Math.round(W * dpr)
+      c.height = Math.round(W * dpr)
+      c.style.width = W + 'px'
+      c.style.height = W + 'px'
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+    const t = (now - orbT0) / 1000
+    const cx = W / 2
+    const cy = W / 2
+    let energy = 0.22
+    let speed = 1.0
+    if (listening) {
+      energy = 0.36 + lv * 0.48
+      speed = 1.08
+    } else if (phase === 'thinking' || phase === 'transcribing') {
+      energy = 0.28
+      speed = 1.4
+    } else if (speaking) {
+      energy = 0.5 + lv * 0.35
+      speed = 1.18
+    }
+
+    const breathe = 1 + Math.sin(t * 2.0 * speed) * (0.028 + energy * 0.02)
+    const R = size * 0.5 * breathe
+    ctx.clearRect(0, 0, W, W)
+
+    const wash = ctx.createRadialGradient(cx, cy, R * 0.15, cx, cy, R * 1.65)
+    wash.addColorStop(0, `rgba(160, 200, 255, ${0.24 + energy * 0.16})`)
+    wash.addColorStop(0.55, `rgba(100, 150, 240, ${0.08 + energy * 0.08})`)
+    wash.addColorStop(1, 'rgba(40, 80, 160, 0)')
+    ctx.fillStyle = wash
+    ctx.beginPath()
+    ctx.arc(cx, cy, R * 1.65, 0, Math.PI * 2)
+    ctx.fill()
+
+    const body = ctx.createRadialGradient(cx - R * 0.22, cy - R * 0.3, R * 0.04, cx, cy + R * 0.08, R)
+    body.addColorStop(0, 'rgba(255,255,255,1)')
+    body.addColorStop(0.3, 'rgba(230,240,255,0.98)')
+    body.addColorStop(0.6, 'rgba(165,200,255,0.94)')
+    body.addColorStop(0.88, `rgba(110,160,245,${0.9 + energy * 0.05})`)
+    body.addColorStop(1, `rgba(70,120,220,${0.55 + energy * 0.12})`)
+    ctx.fillStyle = body
+    ctx.beginPath()
+    ctx.arc(cx, cy, R, 0, Math.PI * 2)
+    ctx.fill()
+
+    ctx.fillStyle = 'rgba(255,255,255,0.55)'
+    ctx.beginPath()
+    ctx.ellipse(cx - R * 0.2, cy - R * 0.26, R * 0.14, R * 0.09, -0.5, 0, Math.PI * 2)
+    ctx.fill()
+
+    orbRaf = requestAnimationFrame(draw)
+  }
+  orbRaf = requestAnimationFrame(draw)
+}
+
+function mountPanel() {
+  if (typeof document === 'undefined') return
+  ensureCss()
+  let panel = document.getElementById(PANEL_ID)
+  if (!panel) {
+    panel = document.createElement('div')
+    panel.id = PANEL_ID
+    panel.setAttribute('data-voice-hud', '1')
+    panel.setAttribute('role', 'dialog')
+    panel.setAttribute('aria-label', 'Voice')
+    panel.innerHTML = `
+      <div class="vh-title" data-vh-title></div>
+      <div class="vh-orb-wrap" data-vh-orb></div>
+      <div class="vh-caption" data-vh-caption></div>
+      <div class="vh-ctrls">
+        <button type="button" class="vh-btn" data-vh-mic aria-label="Mute microphone" title="Mute mic"></button>
+        <button type="button" class="vh-btn" data-vh-spk aria-label="Mute speaker" title="Mute speaker"></button>
+        <button type="button" class="vh-btn vh-end" data-voice-hud-end="1" data-vh-end aria-label="End voice" title="End"></button>
+      </div>
+    `
+    document.body.appendChild(panel)
+
+    panel.querySelector('[data-vh-mic]')?.addEventListener('click', e => {
+      e.preventDefault()
+      e.stopPropagation()
+      toggleMicMute()
+    })
+    panel.querySelector('[data-vh-spk]')?.addEventListener('click', e => {
+      e.preventDefault()
+      e.stopPropagation()
+      toggleSpeakerMute()
+    })
+    panel.querySelector('[data-vh-end]')?.addEventListener('click', e => {
+      e.preventDefault()
+      e.stopPropagation()
+      endVoice()
+    })
+  }
+
+  const wrap = panel.querySelector('[data-vh-orb]')
+  if (wrap && !orbCanvas) {
+    const c = document.createElement('canvas')
+    c.setAttribute('aria-hidden', 'true')
+    c.style.filter = 'drop-shadow(0 10px 28px rgba(80,140,255,0.28))'
+    wrap.innerHTML = ''
+    wrap.appendChild(c)
+    orbCanvas = c
+    startOrbLoop()
+  } else if (orbCanvas && !orbRaf) {
+    startOrbLoop()
+  }
+
+  layoutPanel()
+  paintPanel()
+  if (!layoutTimer) {
+    layoutTimer = window.setInterval(() => {
+      if ($nativeActive.get()) layoutPanel()
+    }, 400)
+  }
+  window.addEventListener('resize', layoutPanel)
+}
+
+function unmountPanel() {
+  if (orbRaf) {
+    cancelAnimationFrame(orbRaf)
+    orbRaf = 0
+  }
+  orbCanvas = null
+  if (layoutTimer) {
+    clearInterval(layoutTimer)
+    layoutTimer = 0
+  }
+  window.removeEventListener('resize', layoutPanel)
+  document.getElementById(PANEL_ID)?.remove()
+  document.getElementById('voice-hud-live-portal')?.remove()
+}
+
+// Composer registration is a no-op strip so plugin stays loaded; UI is the Mac panel.
+function LiveStrip() {
+  const active = useValue($nativeActive)
+  const error = useValue($error)
+
+  useEffect(() => {
+    if (active) mountPanel()
+    else unmountPanel()
+  }, [active])
+
+  if (!active && error) {
+    return jsx('div', {
+      className:
+        'mb-1 rounded-lg border border-destructive/30 bg-destructive/10 px-2 py-1 text-[0.7rem] text-destructive',
+      children: error
+    })
+  }
+  // Nothing in the chat chrome — panel floats cleanly over the workspace
+  return null
 }
 
 function StatusChip() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
   return jsx(Tip, {
-    content: active ? 'Voice Live in this chat — click to End' : 'Start Voice Live in this chat',
+    content: active ? 'Voice panel active — click to End' : 'Start polished Voice panel',
     children: jsx('button', {
       type: 'button',
       className: 'inline-flex',
@@ -896,7 +966,7 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     ensureCss()
-    killLegacyPortal()
+    unmountPanel()
     wireVoiceBus()
     wireDomFallback()
     const offGw = wireGateway()
@@ -920,8 +990,8 @@ export default {
         data: {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle Live (in chat)',
-          keywords: ['voice', 'hud', 'live', 'orb', 'chatgpt'],
+          label: 'Voice HUD: Toggle Mac panel',
+          keywords: ['voice', 'hud', 'live', 'mac', 'orb'],
           run: () => toggleVoice()
         }
       },
@@ -940,7 +1010,7 @@ export default {
         area: KEYBINDS_AREA,
         data: {
           id: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle Live',
+          label: 'Voice HUD: Toggle',
           category: 'Voice',
           defaults: ['mod+shift+v'],
           run: () => toggleVoice()
@@ -957,7 +1027,7 @@ export default {
       unwireVoiceBus()
       stopDomFallback()
       resetSessionUi()
-      killLegacyPortal()
+      unmountPanel()
       document.getElementById(STYLE_ID)?.remove()
       try {
         disposeRegs?.()

@@ -1,15 +1,12 @@
 /**
- * voice-hud — ChatGPT Live–style voice stage over Hermes Desktop native voice.
+ * voice-hud — ChatGPT Live–style voice **inside the chat session**.
  *
- * Target UX (OpenAI Live / GPT-Live product shots):
- *  • Clean light full-session stage over the conversation
- *  • Soft blue–white luminous sphere (not fiber/torus clutter)
- *  • Concentric ripple rings reacting to mic level / phase
- *  • Minimal top "Live" chrome + End
- *  • Ephemeral words only — no chat replay panel
+ * - Soft orb + ripples (not fiber clutter)
+ * - Dark glass card in composer.top — does NOT cover whole Desktop
+ * - YOU / ILO words stay readable (long hold)
+ * - Native hermes:voice-bus only (Desktop Whisper). No second mic.
  *
- * Native stack only: hermes:voice-bus (Desktop Whisper). No second mic.
- * Enabled by default (Live stage). Imports: @hermes/plugin-sdk + react* only.
+ * defaultEnabled: true. Imports: @hermes/plugin-sdk + react* only.
  */
 import {
   Badge,
@@ -34,12 +31,10 @@ const VOICE_BUS_EVENT = 'hermes:voice-bus'
 const STYLE_ID = 'voice-hud-css'
 const END_MISS_TOLERANCE = 12
 const CORE_END_RE = /end voice conversation/i
-/** How long ephemeral words stay fully visible before fade. */
-const WORD_HOLD_MS = 4500
-/** Fade duration (CSS matches). */
-const WORD_FADE_MS = 1200
-/** Keep session overlay up while bus/core says active. */
+const WORD_HOLD_MS = 5000
+const WORD_FADE_MS = 1400
 const SESSION_HOLD_MS = 2500
+const LEGACY_PORTAL_ID = 'voice-hud-live-portal'
 
 /** @typedef {'idle' | 'listening' | 'recording' | 'transcribing' | 'thinking' | 'speaking'} Phase */
 
@@ -53,10 +48,8 @@ const $elapsed = atom(0)
 const $error = atom('')
 const $mode = atom(/** @type {'off' | 'dictation' | 'conversation'} */ ('off'))
 const $busOk = atom(false)
-/** Ephemeral overlay text (fades). */
 const $ghostText = atom('')
 const $ghostRole = atom(/** @type {'you' | 'agent' | ''} */ (''))
-/** 0–1 visual opacity for ghost text. */
 const $ghostOpacity = atom(0)
 
 let pollTimer = 0
@@ -74,6 +67,14 @@ let lastGhostKey = ''
 function formatElapsed(sec) {
   const s = Math.max(0, Math.floor(sec))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+function phaseLabel(p) {
+  if (p === 'listening' || p === 'recording') return 'Listening'
+  if (p === 'transcribing') return 'Got it'
+  if (p === 'thinking') return 'Thinking'
+  if (p === 'speaking') return 'Speaking'
+  return 'Live'
 }
 
 function isHudNode(el) {
@@ -177,11 +178,9 @@ function clearGhost() {
 }
 
 /**
- * Show ephemeral words then fade them away (ChatGPT/Grok orb pattern:
- * speech is felt in the orb; text is temporary).
  * @param {string} text
  * @param {'you' | 'agent'} role
- * @param {{ sticky?: boolean }} [opts] sticky = hold while still streaming (partials)
+ * @param {{ sticky?: boolean }} [opts]
  */
 function showGhostWords(text, role, opts = {}) {
   const t = (text || '').trim()
@@ -189,7 +188,6 @@ function showGhostWords(text, role, opts = {}) {
   const key = `${role}:${t}`
   const sticky = Boolean(opts.sticky)
 
-  // Same partial growing — refresh opacity without restarting full hold if already visible
   if (key === lastGhostKey && sticky) {
     $ghostOpacity.set(1)
     scheduleFade(true)
@@ -209,15 +207,15 @@ function showGhostWords(text, role, opts = {}) {
 
 function scheduleFade(extendOnly) {
   clearFadeTimers()
-  const hold = extendOnly ? WORD_HOLD_MS : WORD_HOLD_MS
+  // sticky partials: long hold; committed: still long enough to read
+  const hold = extendOnly ? WORD_HOLD_MS + 1500 : WORD_HOLD_MS
   fadeTimer = window.setTimeout(() => {
     fadeTimer = 0
     const start = performance.now()
     const from = $ghostOpacity.get()
     const tick = now => {
       const u = Math.min(1, (now - start) / WORD_FADE_MS)
-      const next = from * (1 - u)
-      $ghostOpacity.set(next)
+      $ghostOpacity.set(from * (1 - u))
       if (u < 1 && lastGhostKey) {
         fadeRaf = requestAnimationFrame(tick)
       } else {
@@ -232,6 +230,24 @@ function scheduleFade(extendOnly) {
     }
     fadeRaf = requestAnimationFrame(tick)
   }, hold)
+}
+
+function killLegacyPortal() {
+  if (typeof document === 'undefined') return
+  const el = document.getElementById(LEGACY_PORTAL_ID)
+  if (el) el.remove()
+}
+
+function setLiveAttr(on) {
+  if (typeof document === 'undefined') return
+  // Session-local only — never mark whole Desktop / documentElement
+  document.querySelectorAll('[data-slot="composer-root"], [data-slot="composer-dock"]').forEach(n => {
+    if (on) n.setAttribute('data-voice-hud-live', '1')
+    else n.removeAttribute('data-voice-hud-live')
+  })
+  document.documentElement.removeAttribute('data-voice-hud-live')
+  killLegacyPortal()
+  ensureCss()
 }
 
 function resetSessionUi() {
@@ -319,10 +335,8 @@ function onVoiceBus(ev) {
     const cap = d.caption.trim()
     $caption.set(cap)
     $captionPartial.set(Boolean(d.partial))
-    // YOU words: show while listening/recording/transcribing, then fade
-    if (phase === 'listening' || phase === 'recording' || phase === 'transcribing') {
-      showGhostWords(cap, 'you', { sticky: Boolean(d.partial) })
-    }
+    // Always surface YOU words when bus has a caption
+    showGhostWords(cap, 'you', { sticky: Boolean(d.partial) || phase === 'listening' || phase === 'recording' })
   }
 
   if (active && !$nativeActive.get()) {
@@ -333,8 +347,6 @@ function onVoiceBus(ev) {
   }
 
   if (!active && $nativeActive.get() && !findCoreEndButton()) {
-    // Bus off and no core pill — only tear down after a short hold so
-    // between-turn idle gaps do not collapse the full-session overlay.
     return
   }
 
@@ -353,21 +365,10 @@ function onVoiceBus(ev) {
       $phase.set(phase === 'idle' ? 'listening' : phase)
     }
 
-    // Phase transitions that clear / retarget words
-    if (phase === 'speaking' && prev !== 'speaking') {
-      // Orb takes over — fade YOU words immediately
-      scheduleFade(false)
-    }
-    if (phase === 'listening' && (prev === 'speaking' || prev === 'thinking')) {
-      $caption.set('')
-      $agentLine.set('')
-      // fresh listen — ghost clear
-      clearGhost()
-    }
     if (phase === 'thinking' && prev === 'transcribing') {
-      // brief hold then fade committed YOU caption
       if ($caption.get()) showGhostWords($caption.get(), 'you', { sticky: false })
     }
+    // Do not wipe words the instant listening restarts — let hold/fade handle it
   }
 }
 
@@ -388,6 +389,7 @@ function wireDomFallback() {
   let lastSeenLive = 0
   pollTimer = window.setInterval(() => {
     if (ending) return
+    killLegacyPortal()
     const endBtn = findCoreEndButton()
     const busAlive = $busOk.get() && $mode.get() !== 'off'
     if (endBtn || busAlive) {
@@ -414,8 +416,6 @@ function wireDomFallback() {
       }
     } else if ($nativeActive.get()) {
       endMisses += 1
-      // Hold full-session overlay across turn gaps; only collapse after
-      // both core End and bus have been gone for a while.
       if (
         endMisses >= END_MISS_TOLERANCE &&
         Date.now() - lastSeenLive > SESSION_HOLD_MS &&
@@ -442,433 +442,75 @@ function ensureCss() {
     document.head.appendChild(el)
   }
   el.textContent = `
-/* Hide stock voice strip while Live owns the surface */
+/* Hide stock voice strip while in-chat Live is up */
 [data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
   display: none !important;
 }
-/* Soften thread behind Live stage (ChatGPT keeps context faintly) */
+/* Keep chat readable — no full-desktop dim */
 [data-voice-hud-live="1"] [data-slot="messages"],
 [data-voice-hud-live="1"] [data-slot="thread"],
-[data-voice-hud-live="1"] main [data-session-scroll],
-html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
-  opacity: 0.2 !important;
-  filter: blur(1px);
-  pointer-events: none !important;
-  transition: opacity 0.45s ease, filter 0.45s ease;
+[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
+  opacity: 1 !important;
+  filter: none !important;
+  pointer-events: auto !important;
 }
-/* Full-session Live stage — light canvas like ChatGPT Live */
-[data-voice-hud="1"].vh-session {
-  position: fixed !important;
-  inset: 0 !important;
-  z-index: 80 !important;
-  display: flex !important;
-  flex-direction: column !important;
-  align-items: center !important;
-  justify-content: center !important;
-  margin: 0 !important;
-  padding: 1.25rem 1rem 6.5rem !important;
-  border: none !important;
-  border-radius: 0 !important;
-  /* Dark Live stage — Hermes night, soft blue orb glow (not blinding white) */
-  background:
-    radial-gradient(circle at 50% 46%, rgba(56, 120, 220, 0.18) 0%, rgba(15, 23, 42, 0.55) 42%, rgba(6, 8, 14, 0.94) 72%, #05070c 100%) !important;
-  backdrop-filter: blur(18px) saturate(1.05) !important;
-  -webkit-backdrop-filter: blur(18px) saturate(1.05) !important;
-  box-shadow: none !important;
-  color: #e2e8f0 !important;
-}
-/* Concentric guide rings (static base; canvas draws active ripples) */
-[data-voice-hud="1"].vh-session::before {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 46%;
-  width: min(92vmin, 720px);
-  height: min(92vmin, 720px);
-  transform: translate(-50%, -50%);
-  border-radius: 50%;
-  background:
-    radial-gradient(circle, transparent 18%, rgba(96, 165, 250, 0.12) 18.5%, transparent 19%),
-    radial-gradient(circle, transparent 28%, rgba(96, 165, 250, 0.10) 28.5%, transparent 29.5%),
-    radial-gradient(circle, transparent 38%, rgba(96, 165, 250, 0.12) 38.5%, transparent 39.5%),
-    radial-gradient(circle, transparent 48%, rgba(96, 165, 250, 0.08) 48.5%, transparent 49.5%),
-    radial-gradient(circle, transparent 58%, rgba(96, 165, 250, 0.06) 58.5%, transparent 59.5%);
-  pointer-events: none;
-  z-index: 0;
-}
-[data-voice-hud="1"] .vh-stage {
+/* In-chat Live card (composer.top) */
+[data-voice-hud="1"].vh-inchat {
   position: relative;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
+  z-index: 5;
   width: 100%;
-  height: 100%;
+  margin: 0 0 0.45rem 0;
+  padding: 0.75rem 0.9rem 0.9rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background:
+    radial-gradient(ellipse 80% 90% at 50% 35%, rgba(56, 120, 220, 0.14), transparent 62%),
+    rgba(10, 14, 22, 0.94);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 6px 22px rgba(0,0,0,0.22);
+  color: #e2e8f0;
+  overflow: hidden;
 }
-[data-voice-hud="1"] .vh-topbar {
-  position: absolute;
-  top: 1rem;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 2;
+[data-voice-hud="1"].vh-inchat .vh-top {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  min-width: min(20rem, calc(100% - 2rem));
   justify-content: space-between;
-  padding: 0.35rem 0.5rem 0.35rem 0.85rem;
-  border-radius: 999px;
-  background: rgba(8, 12, 22, 0.72);
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.35);
-  backdrop-filter: blur(14px);
+  gap: 0.5rem;
+  margin-bottom: 0.15rem;
 }
-[data-voice-hud="1"] .vh-live-pill {
+[data-voice-hud="1"].vh-inchat .vh-pill {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
-  font-size: 0.92rem;
+  font-size: 0.78rem;
   font-weight: 600;
-  letter-spacing: -0.01em;
   color: #f1f5f9;
 }
-[data-voice-hud="1"] .vh-live-dot {
-  width: 0.45rem;
-  height: 0.45rem;
+[data-voice-hud="1"].vh-inchat .vh-dot {
+  width: 0.42rem;
+  height: 0.42rem;
   border-radius: 999px;
   background: #22c55e;
-  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.15);
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.16);
 }
-[data-voice-hud="1"] .vh-live-dot[data-on="speak"] {
+[data-voice-hud="1"].vh-inchat .vh-dot[data-on="speak"] {
   background: #3b82f6;
-  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.18);
-  animation: vh-pulse 1.2s ease-in-out infinite;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
 }
-[data-voice-hud="1"] .vh-live-dot[data-on="think"] {
+[data-voice-hud="1"].vh-inchat .vh-dot[data-on="think"] {
   background: #f59e0b;
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.16);
 }
-@keyframes vh-pulse {
-  0%, 100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.15); opacity: 0.75; }
+[data-voice-hud="1"].vh-inchat .vh-words {
+  min-height: 2.6rem;
+  text-align: center;
+  transition: opacity 0.35s ease;
 }
-[data-voice-hud="1"] .vh-ghost {
-  transition: opacity 0.4s ease, transform 0.45s ease;
-  will-change: opacity, transform;
-  color: #e2e8f0;
-}
-[data-voice-hud="1"] .vh-orb-shell {
-  filter: drop-shadow(0 12px 40px rgba(96, 165, 250, 0.28));
-}
-[data-voice-hud-live="1"] [data-slot="composer-root"],
-[data-voice-hud="1"] .vh-end-btn {
-  height: 2rem;
-  border: none;
-  border-radius: 999px;
-  padding: 0 0.9rem;
-  background: transparent;
-  color: #e2e8f0;
-  font-size: 0.8rem;
-  font-weight: 600;
-  cursor: pointer;
-}
-[data-voice-hud="1"] .vh-end-btn:hover {
-  background: rgba(148, 163, 184, 0.12);
-}
-[data-voice-hud="1"] .vh-orb-wrap {
-  display: flex;
-  flex: 1;
-  align-items: center;
-  justify-content: center;
-  min-height: 220px;
-}
-[data-voice-hud="1"] .vh-ghost {
-  min-height: 3.25rem;
-  width: min(28rem, 100%);
-  padding: 0 1.5rem;
-  transition: opacity 0.4s ease, transform 0.45s ease;
-}
-#voice-hud-live-portal {
-  /* beat any app stacking context */
-  z-index: 2147483000 !important;
-}
-[data-voice-hud-live="1"] [data-slot="composer-dock"] {
-  position: relative;
-  z-index: 90 !important;
-}
+/* Kill legacy full-desktop portal if hot-reload left one */
+#${LEGACY_PORTAL_ID} { display: none !important; visibility: hidden !important; pointer-events: none !important; }
 `
 }
 
-function setLiveAttr(on) {
-  if (typeof document === 'undefined') return
-  document.querySelectorAll('[data-slot="composer-root"], [data-slot="composer-dock"]').forEach(n => {
-    if (on) n.setAttribute('data-voice-hud-live', '1')
-    else n.removeAttribute('data-voice-hud-live')
-  })
-  if (on) document.documentElement.setAttribute('data-voice-hud-live', '1')
-  else document.documentElement.removeAttribute('data-voice-hud-live')
-  ensureCss()
-  // CRITICAL: paint full Live stage on document.body — composer.top clips fixed overlays
-  if (on) mountLivePortal()
-  else unmountLivePortal()
-}
-
-const PORTAL_ID = 'voice-hud-live-portal'
-let portalRaf = 0
-let portalCanvas = null
-let portalT0 = 0
-
-function unmountLivePortal() {
-  if (portalRaf) {
-    cancelAnimationFrame(portalRaf)
-    portalRaf = 0
-  }
-  portalCanvas = null
-  document.getElementById(PORTAL_ID)?.remove()
-}
-
-function mountLivePortal() {
-  if (typeof document === 'undefined') return
-  let root = document.getElementById(PORTAL_ID)
-  if (!root) {
-    root = document.createElement('div')
-    root.id = PORTAL_ID
-    root.setAttribute('data-voice-hud', '1')
-    root.setAttribute('data-voice-hud-portal', '1')
-    root.className = 'vh-session'
-    root.innerHTML = `
-      <div class="vh-stage">
-        <div class="vh-topbar">
-          <div class="vh-live-pill">
-            <span class="vh-live-dot" data-on="listen" data-vh-dot></span>
-            <span>Live</span>
-            <span class="vh-phase" data-vh-phase-label style="font-size:0.72rem;font-weight:400;color:#94a3b8"></span>
-          </div>
-          <button type="button" class="vh-end-btn" data-voice-hud-end="1" aria-label="Stop voice HUD">End</button>
-        </div>
-        <div class="vh-orb-wrap" data-vh-orb-wrap></div>
-        <div class="vh-ghost" data-vh-ghost aria-hidden="true"></div>
-      </div>
-    `
-    // Inline critical styles so stage works even if CSS inject lags
-    root.style.cssText = [
-      'position:fixed',
-      'inset:0',
-      'z-index:2147483000',
-      'display:flex',
-      'flex-direction:column',
-      'align-items:center',
-      'justify-content:center',
-      'padding:1.25rem 1rem 6.5rem',
-      'margin:0',
-      'border:none',
-      'pointer-events:auto',
-      'background:radial-gradient(circle at 50% 46%, rgba(56,120,220,0.2) 0%, rgba(15,23,42,0.62) 42%, rgba(6,8,14,0.95) 72%, #05070c 100%)'
-    ].join(';')
-    document.body.appendChild(root)
-
-    root.querySelector('[data-voice-hud-end]')?.addEventListener('click', e => {
-      e.preventDefault()
-      e.stopPropagation()
-      endVoice()
-    })
-  }
-
-  // Canvas orb
-  const wrap = root.querySelector('[data-vh-orb-wrap]')
-  if (wrap && !portalCanvas) {
-    const c = document.createElement('canvas')
-    c.className = 'vh-orb-shell'
-    c.setAttribute('aria-hidden', 'true')
-    wrap.innerHTML = ''
-    wrap.appendChild(c)
-    portalCanvas = c
-    portalT0 = performance.now()
-    startPortalOrbLoop()
-  }
-
-  paintLivePortalChrome()
-}
-
-function paintLivePortalChrome() {
-  const root = document.getElementById(PORTAL_ID)
-  if (!root) return
-  const phase = $phase.get()
-  const listening = phase === 'listening' || phase === 'recording'
-  const speaking = phase === 'speaking'
-  const thinking = phase === 'thinking' || phase === 'transcribing'
-  const label = root.querySelector('[data-vh-phase-label]')
-  if (label) {
-    label.textContent =
-      listening ? 'Listening' : speaking ? 'Speaking' : thinking ? (phase === 'transcribing' ? 'Got it' : 'Thinking') : 'Live'
-  }
-  const dot = root.querySelector('[data-vh-dot]')
-  if (dot) dot.setAttribute('data-on', speaking ? 'speak' : thinking ? 'think' : 'listen')
-
-  const ghost = root.querySelector('[data-vh-ghost]')
-  if (ghost) {
-    const text = $ghostText.get()
-    const op = $ghostOpacity.get()
-    const role = $ghostRole.get()
-    // Prefer live caption from bus if ghost empty (YOU words)
-    const caption = ($caption.get() || '').trim()
-    const showText = (text && op > 0.02) ? text : caption
-    const showRole = (text && op > 0.02) ? role : caption ? 'you' : ''
-    const showOp = (text && op > 0.02) ? op : caption ? 1 : 0
-
-    if (showText && showOp > 0.02) {
-      ghost.style.opacity = String(showOp)
-      ghost.style.transform = `translateY(${(1 - showOp) * 6}px)`
-      ghost.setAttribute('aria-hidden', 'false')
-      const roleColor = showRole === 'agent' ? '#7dd3fc' : '#86efac'
-      const bodyColor = showRole === 'agent' ? '#e0f2fe' : '#f8fafc'
-      ghost.innerHTML =
-        `<div style="text-align:center;max-width:36rem;margin:0 auto;padding:0.5rem 1rem">` +
-        `<div style="margin-bottom:0.4rem;font-size:0.7rem;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;color:${roleColor}">${
-          showRole === 'agent' ? 'ILO' : 'YOU'
-        }</div>` +
-        `<div style="display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;font-size:1.2rem;font-weight:500;line-height:1.4;letter-spacing:-0.01em;color:${bodyColor};text-shadow:0 1px 18px rgba(0,0,0,0.55)">${escapeHtml(
-          showText
-        )}</div></div>`
-    } else {
-      ghost.style.opacity = listening ? '0.85' : '0.55'
-      ghost.setAttribute('aria-hidden', 'false')
-      ghost.innerHTML = listening
-        ? `<div style="text-align:center;color:#94a3b8;font-size:0.95rem;font-weight:500">Listening — speak anytime</div>`
-        : `<div style="text-align:center;color:#64748b;font-size:0.9rem">${$busOk.get() ? phaseLabelSafe(phase) : 'Starting Live…'}</div>`
-    }
-  }
-}
-
-function phaseLabelSafe(p) {
-  if (p === 'listening' || p === 'recording') return 'Listening'
-  if (p === 'transcribing') return 'Got it'
-  if (p === 'thinking') return 'Thinking'
-  if (p === 'speaking') return 'Speaking'
-  return 'Live'
-}
-
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-function startPortalOrbLoop() {
-  if (portalRaf) cancelAnimationFrame(portalRaf)
-  const draw = now => {
-    const c = portalCanvas
-    const root = document.getElementById(PORTAL_ID)
-    if (!c || !root || !$nativeActive.get()) {
-      portalRaf = 0
-      return
-    }
-    const ctx = c.getContext('2d')
-    if (!ctx) {
-      portalRaf = requestAnimationFrame(draw)
-      return
-    }
-
-    const phase = $phase.get()
-    const lv = Math.max(0, Math.min(1, $level.get()))
-    const speaking = phase === 'speaking'
-    const listening = phase === 'listening' || phase === 'recording'
-    const size = speaking ? 168 : listening ? 156 : 148
-    const pad = Math.round(size * 0.85)
-    const W = size + pad * 2
-    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
-    if (c.width !== Math.round(W * dpr)) {
-      c.width = Math.round(W * dpr)
-      c.height = Math.round(W * dpr)
-      c.style.width = W + 'px'
-      c.style.height = W + 'px'
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-
-    const t = (now - portalT0) / 1000
-    const cx = W / 2
-    const cy = W / 2
-    let energy = 0.2
-    let speed = 1.0
-    if (listening) {
-      energy = 0.35 + lv * 0.55
-      speed = 1.15
-    } else if (phase === 'thinking' || phase === 'transcribing') {
-      energy = 0.28
-      speed = 1.5
-    } else if (speaking) {
-      energy = 0.55 + lv * 0.4
-      speed = 1.25
-    }
-    const breathe = 1 + Math.sin(t * 2.0 * speed) * (0.03 + energy * 0.025)
-    const R = size * 0.5 * breathe
-    ctx.clearRect(0, 0, W, W)
-
-    // Concentric ripples — ChatGPT Live signature
-    for (let i = 0; i < 5; i++) {
-      const phaseOff = (t * speed * 0.35 + i / 5) % 1
-      const rr = R * (1.15 + phaseOff * (1.9 + energy * 0.6))
-      const alpha = (1 - phaseOff) * (0.1 + energy * 0.16)
-      ctx.beginPath()
-      ctx.arc(cx, cy, rr, 0, Math.PI * 2)
-      ctx.strokeStyle = `rgba(147, 197, 253, ${alpha})`
-      ctx.lineWidth = 1.25 + (1 - phaseOff) * 1.5
-      ctx.stroke()
-    }
-
-    const bloom = ctx.createRadialGradient(cx, cy, R * 0.3, cx, cy, R * 1.55)
-    bloom.addColorStop(0, `rgba(191, 219, 254, ${0.35 + energy * 0.25})`)
-    bloom.addColorStop(0.55, `rgba(191, 219, 254, ${0.12 + energy * 0.1})`)
-    bloom.addColorStop(1, 'rgba(191, 219, 254, 0)')
-    ctx.fillStyle = bloom
-    ctx.beginPath()
-    ctx.arc(cx, cy, R * 1.55, 0, Math.PI * 2)
-    ctx.fill()
-
-    const body = ctx.createRadialGradient(cx - R * 0.2, cy - R * 0.25, R * 0.05, cx + R * 0.05, cy + R * 0.1, R)
-    body.addColorStop(0, 'rgba(255,255,255,1)')
-    body.addColorStop(0.28, 'rgba(239,246,255,0.98)')
-    body.addColorStop(0.55, 'rgba(191,219,254,0.95)')
-    body.addColorStop(0.82, `rgba(147,197,253,${0.9 + energy * 0.05})`)
-    body.addColorStop(1, `rgba(96,165,250,${0.55 + energy * 0.15})`)
-    ctx.fillStyle = body
-    ctx.beginPath()
-    ctx.arc(cx, cy, R, 0, Math.PI * 2)
-    ctx.fill()
-
-    ctx.save()
-    ctx.beginPath()
-    ctx.arc(cx, cy, R * 0.95, 0, Math.PI * 2)
-    ctx.clip()
-    const ox = Math.cos(t * 0.7) * R * 0.12
-    const oy = Math.sin(t * 0.9) * R * 0.1
-    const inner = ctx.createRadialGradient(cx + ox, cy + oy, 0, cx + ox, cy + oy, R * 0.7)
-    inner.addColorStop(0, `rgba(255,255,255,${0.55 + energy * 0.15})`)
-    inner.addColorStop(0.4, 'rgba(219,234,254,0.25)')
-    inner.addColorStop(1, 'rgba(147,197,253,0)')
-    ctx.fillStyle = inner
-    ctx.beginPath()
-    ctx.arc(cx + ox, cy + oy, R * 0.7, 0, Math.PI * 2)
-    ctx.fill()
-    ctx.restore()
-
-    ctx.fillStyle = 'rgba(255,255,255,0.65)'
-    ctx.beginPath()
-    ctx.ellipse(cx - R * 0.22, cy - R * 0.28, R * 0.18, R * 0.11, -0.5, 0, Math.PI * 2)
-    ctx.fill()
-
-    paintLivePortalChrome()
-    portalRaf = requestAnimationFrame(draw)
-  }
-  portalRaf = requestAnimationFrame(draw)
-}
-
 function wireGateway() {
-
   return host.onEvent('*', event => {
     if (!event || typeof event !== 'object') return
     if (!$nativeActive.get() && !findCoreEndButton()) return
@@ -881,36 +523,26 @@ function wireGateway() {
     if (type === 'message.start') {
       $agentLine.set('')
       $phase.set('thinking')
-      // thinking: orb only — fade residual YOU text
-      scheduleFade(false)
     } else if (type === 'message.delta') {
       const chunk = String(payload.text || payload.delta || '')
       if (!chunk) return
-      const next = ($agentLine.get() + chunk).slice(-320)
+      const next = ($agentLine.get() + chunk).slice(-420)
       $agentLine.set(next)
       $phase.set('speaking')
-      // Brief ghost of agent words then they disappear — orb is the voice
-      showGhostWords(next.slice(-160), 'agent', { sticky: true })
+      showGhostWords(next.slice(-240), 'agent', { sticky: true })
     } else if (type === 'message.complete') {
+      if ($agentLine.get()) showGhostWords($agentLine.get().slice(-240), 'agent', { sticky: false })
       $agentLine.set('')
-      // Final fade-out of agent words
-      scheduleFade(false)
       if (findCoreEndButton() || $nativeActive.get()) {
         $phase.set('listening')
-        $caption.set('')
-        $captionPartial.set(false)
-        // After a beat, clear ghost fully for clean listen
-        window.setTimeout(() => {
-          if ($phase.get() === 'listening') clearGhost()
-        }, WORD_HOLD_MS + WORD_FADE_MS)
       }
     }
   })
 }
 
-// --- Orb (primary UI — AI “speaks through” this) -----------------------------
+// --- Soft Live orb (in-chat scale) -------------------------------------------
 
-function VoiceOrb({ size = 180 }) {
+function VoiceOrb({ size = 96 }) {
   const ref = useRef(null)
   const level = useValue($level)
   const phase = useValue($phase)
@@ -927,8 +559,7 @@ function VoiceOrb({ size = 180 }) {
     let raf = 0
     const t0 = performance.now()
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
-    // Extra room for expanding ripples (ChatGPT Live rings)
-    const pad = Math.round(size * 0.85)
+    const pad = Math.round(size * 0.5)
     const W = size + pad * 2
     c.width = Math.round(W * dpr)
     c.height = Math.round(W * dpr)
@@ -936,10 +567,6 @@ function VoiceOrb({ size = 180 }) {
     c.style.height = W + 'px'
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-    /**
-     * ChatGPT Live orb: soft blue–white sphere + concentric ripples.
-     * Reference: OpenAI Live product UI (center phone in marketing shot).
-     */
     const draw = now => {
       const t = (now - t0) / 1000
       const cx = W / 2
@@ -947,88 +574,63 @@ function VoiceOrb({ size = 180 }) {
       const ph = pr.current
       const lv = Math.max(0, Math.min(1, lr.current))
 
-      let energy = 0.2
+      let energy = 0.22
       let speed = 1.0
-      // Soft blue family (screenshot): periwinkle → white
       if (ph === 'listening' || ph === 'recording') {
-        energy = 0.35 + lv * 0.55
-        speed = 1.15
+        energy = 0.38 + lv * 0.5
+        speed = 1.12
       } else if (ph === 'transcribing' || ph === 'thinking') {
-        energy = 0.28
-        speed = 1.5
+        energy = 0.3
+        speed = 1.45
       } else if (ph === 'speaking') {
-        energy = 0.55 + lv * 0.4
-        speed = 1.25
+        energy = 0.52 + lv * 0.38
+        speed = 1.22
       }
 
       const breathe = 1 + Math.sin(t * 2.0 * speed) * (0.03 + energy * 0.025)
       const R = size * 0.5 * breathe
-
       ctx.clearRect(0, 0, W, W)
 
-      // Concentric ripples (ChatGPT Live signature)
-      const ringCount = 5
-      for (let i = 0; i < ringCount; i++) {
-        const phaseOff = (t * speed * 0.35 + i / ringCount) % 1
-        const rr = R * (1.15 + phaseOff * (1.9 + energy * 0.6))
-        const alpha = (1 - phaseOff) * (0.1 + energy * 0.16)
+      for (let i = 0; i < 4; i++) {
+        const phaseOff = (t * speed * 0.35 + i / 4) % 1
+        const rr = R * (1.12 + phaseOff * (1.55 + energy * 0.45))
+        const alpha = (1 - phaseOff) * (0.1 + energy * 0.14)
         ctx.beginPath()
         ctx.arc(cx, cy, rr, 0, Math.PI * 2)
-        ctx.strokeStyle = `rgba(147, 197, 253, ${alpha})`
-        ctx.lineWidth = 1.25 + (1 - phaseOff) * 1.5
+        ctx.strokeStyle = `rgba(125, 180, 255, ${alpha})`
+        ctx.lineWidth = 1.2 + (1 - phaseOff) * 1.2
         ctx.stroke()
       }
 
-      // Soft outer bloom
-      const bloom = ctx.createRadialGradient(cx, cy, R * 0.3, cx, cy, R * 1.55)
-      bloom.addColorStop(0, `rgba(191, 219, 254, ${0.35 + energy * 0.25})`)
-      bloom.addColorStop(0.55, `rgba(191, 219, 254, ${0.12 + energy * 0.1})`)
-      bloom.addColorStop(1, 'rgba(191, 219, 254, 0)')
+      const bloom = ctx.createRadialGradient(cx, cy, R * 0.25, cx, cy, R * 1.45)
+      bloom.addColorStop(0, `rgba(120, 170, 255, ${0.28 + energy * 0.2})`)
+      bloom.addColorStop(0.55, `rgba(80, 130, 220, ${0.1 + energy * 0.08})`)
+      bloom.addColorStop(1, 'rgba(40, 80, 160, 0)')
       ctx.fillStyle = bloom
       ctx.beginPath()
-      ctx.arc(cx, cy, R * 1.55, 0, Math.PI * 2)
+      ctx.arc(cx, cy, R * 1.45, 0, Math.PI * 2)
       ctx.fill()
 
-      // Main soft sphere — white core → soft blue edge (exact Live look)
       const body = ctx.createRadialGradient(
-        cx - R * 0.2,
-        cy - R * 0.25,
+        cx - R * 0.22,
+        cy - R * 0.28,
         R * 0.05,
-        cx + R * 0.05,
-        cy + R * 0.1,
+        cx,
+        cy + R * 0.08,
         R
       )
-      body.addColorStop(0, 'rgba(255, 255, 255, 1)')
-      body.addColorStop(0.28, 'rgba(239, 246, 255, 0.98)')
-      body.addColorStop(0.55, `rgba(191, 219, 254, ${0.95})`)
-      body.addColorStop(0.82, `rgba(147, 197, 253, ${0.9 + energy * 0.05})`)
-      body.addColorStop(1, `rgba(96, 165, 250, ${0.55 + energy * 0.15})`)
+      body.addColorStop(0, 'rgba(240, 248, 255, 0.98)')
+      body.addColorStop(0.35, 'rgba(180, 210, 255, 0.92)')
+      body.addColorStop(0.72, `rgba(90, 140, 230, ${0.88 + energy * 0.05})`)
+      body.addColorStop(1, `rgba(40, 80, 160, ${0.55 + energy * 0.12})`)
       ctx.fillStyle = body
       ctx.beginPath()
       ctx.arc(cx, cy, R, 0, Math.PI * 2)
       ctx.fill()
 
-      // Inner soft caustic (very subtle motion)
-      ctx.save()
+      ctx.fillStyle = 'rgba(255,255,255,0.55)'
       ctx.beginPath()
-      ctx.arc(cx, cy, R * 0.95, 0, Math.PI * 2)
-      ctx.clip()
-      const ox = Math.cos(t * 0.7) * R * 0.12
-      const oy = Math.sin(t * 0.9) * R * 0.1
-      const inner = ctx.createRadialGradient(cx + ox, cy + oy, 0, cx + ox, cy + oy, R * 0.7)
-      inner.addColorStop(0, `rgba(255,255,255,${0.55 + energy * 0.15})`)
-      inner.addColorStop(0.4, 'rgba(219, 234, 254, 0.25)')
-      inner.addColorStop(1, 'rgba(147, 197, 253, 0)')
-      ctx.fillStyle = inner
-      ctx.beginPath()
-      ctx.arc(cx + ox, cy + oy, R * 0.7, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.restore()
-
-      // Tiny specular
-      ctx.fillStyle = 'rgba(255,255,255,0.65)'
-      ctx.beginPath()
-      ctx.ellipse(cx - R * 0.22, cy - R * 0.28, R * 0.18, R * 0.11, -0.5, 0, Math.PI * 2)
+      ctx.ellipse(cx - R * 0.22, cy - R * 0.28, R * 0.16, R * 0.1, -0.5, 0, Math.PI * 2)
       ctx.fill()
 
       raf = requestAnimationFrame(draw)
@@ -1040,26 +642,24 @@ function VoiceOrb({ size = 180 }) {
   return jsx('canvas', {
     ref,
     'aria-hidden': true,
-    className: 'vh-orb-shell block mx-auto'
+    className: 'block mx-auto',
+    style: { filter: 'drop-shadow(0 6px 20px rgba(80,140,255,0.28))' }
   })
-}
-
-function phaseLabel(p) {
-  if (p === 'listening' || p === 'recording') return 'Listening'
-  if (p === 'transcribing') return 'Got it'
-  if (p === 'thinking') return 'Thinking'
-  if (p === 'speaking') return 'Speaking'
-  return 'Live'
 }
 
 function LiveStrip() {
   const active = useValue($nativeActive)
+  const phase = useValue($phase)
+  const ghostText = useValue($ghostText)
+  const ghostRole = useValue($ghostRole)
+  const ghostOpacity = useValue($ghostOpacity)
+  const caption = useValue($caption)
   const error = useValue($error)
+  const busOk = useValue($busOk)
+  const elapsed = useValue($elapsed)
 
-  // Body portal owns the Live stage (composer.top would clip full-screen).
   useEffect(() => {
-    if (active) mountLivePortal()
-    else unmountLivePortal()
+    killLegacyPortal()
   }, [active])
 
   if (!active) {
@@ -1073,12 +673,95 @@ function LiveStrip() {
     return null
   }
 
-  // Invisible anchor — keeps React tree alive while portal paints
-  return jsx('div', {
+  const listening = phase === 'listening' || phase === 'recording'
+  const speaking = phase === 'speaking'
+  const thinking = phase === 'thinking' || phase === 'transcribing'
+  const orbSize = speaking ? 104 : listening ? 96 : 90
+
+  const showText = ghostText && ghostOpacity > 0.02 ? ghostText : (caption || '').trim()
+  const showRole = ghostText && ghostOpacity > 0.02 ? ghostRole : showText ? 'you' : ''
+  const showOp = ghostText && ghostOpacity > 0.02 ? ghostOpacity : showText ? 1 : 0
+  const dotOn = speaking ? 'speak' : thinking ? 'think' : 'listen'
+
+  return jsxs('div', {
+    className: 'vh-inchat',
+    role: 'status',
+    'aria-live': 'polite',
     'data-voice-hud': '1',
-    'data-voice-hud-anchor': '1',
-    style: { display: 'none' },
-    'aria-hidden': true
+    'data-vh-phase': phase,
+    children: [
+      jsxs('div', {
+        className: 'vh-top',
+        children: [
+          jsxs('div', {
+            className: 'vh-pill',
+            children: [
+              jsx('span', { className: 'vh-dot', 'data-on': dotOn }),
+              jsx('span', { children: 'Live' }),
+              jsx('span', {
+                className: 'text-[0.72rem] font-normal text-slate-400',
+                children: phaseLabel(phase)
+              }),
+              jsx('span', {
+                className: 'font-mono text-[0.68rem] tabular-nums text-slate-500',
+                children: formatElapsed(elapsed / 1000)
+              })
+            ]
+          }),
+          jsx(Button, {
+            type: 'button',
+            size: 'sm',
+            variant: 'ghost',
+            className:
+              'h-7 shrink-0 rounded-full border border-white/10 px-3 text-[0.75rem] text-slate-200 hover:bg-white/10',
+            'aria-label': 'Stop voice HUD',
+            'data-voice-hud-end': '1',
+            onClick: e => {
+              e.preventDefault()
+              e.stopPropagation()
+              endVoice()
+            },
+            children: 'End'
+          })
+        ]
+      }),
+      jsx('div', {
+        className: 'flex justify-center py-0.5',
+        children: jsx(VoiceOrb, { size: orbSize })
+      }),
+      jsx('div', {
+        className: 'vh-words',
+        style: { opacity: showText && showOp > 0.02 ? showOp : listening ? 0.92 : 0.7 },
+        children:
+          showText && showOp > 0.02
+            ? jsxs('div', {
+                children: [
+                  jsx('div', {
+                    className: cn(
+                      'mb-1 text-[0.68rem] font-bold uppercase tracking-[0.16em]',
+                      showRole === 'agent' ? 'text-sky-300' : 'text-emerald-300'
+                    ),
+                    children: showRole === 'agent' ? 'ILO' : 'YOU'
+                  }),
+                  jsx('div', {
+                    className: cn(
+                      'line-clamp-3 text-[1.08rem] font-medium leading-snug',
+                      showRole === 'agent' ? 'text-sky-50' : 'text-slate-50'
+                    ),
+                    children: showText
+                  })
+                ]
+              })
+            : jsx('div', {
+                className: 'text-[0.92rem] font-medium text-slate-400',
+                children: !busOk
+                  ? 'Starting Live…'
+                  : listening
+                    ? 'Listening — speak anytime'
+                    : phaseLabel(phase)
+              })
+      })
+    ]
   })
 }
 
@@ -1086,9 +769,7 @@ function StatusChip() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
   return jsx(Tip, {
-    content: active
-      ? 'Live voice active — click to End'
-      : 'Start ChatGPT Live–style voice stage',
+    content: active ? 'Live voice (in chat) — click to End' : 'Start Live voice in this chat',
     children: jsx('button', {
       type: 'button',
       className: 'inline-flex',
@@ -1108,6 +789,7 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     ensureCss()
+    killLegacyPortal()
     wireVoiceBus()
     wireDomFallback()
     const offGw = wireGateway()
@@ -1131,8 +813,8 @@ export default {
         data: {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle Live voice',
-          keywords: ['voice', 'hud', 'orb', 'chatgpt', 'grok'],
+          label: 'Voice HUD: Toggle Live (in chat)',
+          keywords: ['voice', 'hud', 'live', 'orb'],
           run: () => toggleVoice()
         }
       },
@@ -1141,7 +823,7 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'voice-hud.end',
-          label: 'Voice HUD: Stop',
+          label: 'Voice HUD: End Live',
           keywords: ['voice', 'end', 'stop'],
           run: () => endVoice()
         }
@@ -1151,7 +833,7 @@ export default {
         area: KEYBINDS_AREA,
         data: {
           id: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle Live voice',
+          label: 'Voice HUD: Toggle Live',
           category: 'Voice',
           defaults: ['mod+shift+v'],
           run: () => toggleVoice()
@@ -1168,7 +850,7 @@ export default {
       unwireVoiceBus()
       stopDomFallback()
       resetSessionUi()
-      unmountLivePortal()
+      killLegacyPortal()
       document.getElementById(STYLE_ID)?.remove()
       try {
         disposeRegs?.()

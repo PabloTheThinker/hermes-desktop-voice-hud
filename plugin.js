@@ -1,16 +1,18 @@
 /**
- * voice-hud — skin over Hermes Desktop *native* voice (dictation + conversation).
+ * voice-hud — Grok/ChatGPT-style orb-first skin over Desktop native voice.
  *
- * Does NOT run Web Speech / getUserMedia / MediaRecorder.
- * Captions + levels come from Desktop's voice bus:
- *   window CustomEvent "hermes:voice-bus"
- * published by use-voice-conversation / use-voice-recorder using the same
- * Whisper STT path as dictation (progressive chunk STT + final).
+ * Research (2026): ChatGPT Advanced Voice used a full-screen reactive orb
+ * (listen/think/speak). Later ChatGPT folded voice into chat with transcripts;
+ * classic orb UX still prioritizes motion over persistent text. Grok voice
+ * uses colored orbs / speech-forward visuals. AI UX pattern: voice visualizer
+ * = phase-reactive motion; words are ephemeral.
  *
- * End/Stop never matches HUD controls (no open/close loop).
- * No chat-history replay — one caption line only.
+ * This skin:
+ *  • Large center orb is the “speaker” — energy follows bus level + phase
+ *  • Captions appear briefly then fade (words disappear)
+ *  • No chat-history replay; native hermes:voice-bus only (no second mic)
+ *  • Stop never self-clicks core End
  *
- * Requires Desktop build that includes lib/voice-bus.ts.
  * Opt-in: defaultEnabled false. Imports: @hermes/plugin-sdk + react* only.
  */
 import {
@@ -36,6 +38,10 @@ const VOICE_BUS_EVENT = 'hermes:voice-bus'
 const STYLE_ID = 'voice-hud-css'
 const END_MISS_TOLERANCE = 5
 const CORE_END_RE = /end voice conversation/i
+/** How long ephemeral words stay fully visible before fade. */
+const WORD_HOLD_MS = 1400
+/** Fade duration (CSS matches). */
+const WORD_FADE_MS = 900
 
 /** @typedef {'idle' | 'listening' | 'recording' | 'transcribing' | 'thinking' | 'speaking'} Phase */
 
@@ -49,15 +55,23 @@ const $elapsed = atom(0)
 const $error = atom('')
 const $mode = atom(/** @type {'off' | 'dictation' | 'conversation'} */ ('off'))
 const $busOk = atom(false)
+/** Ephemeral overlay text (fades). */
+const $ghostText = atom('')
+const $ghostRole = atom(/** @type {'you' | 'agent' | ''} */ (''))
+/** 0–1 visual opacity for ghost text. */
+const $ghostOpacity = atom(0)
 
 let pollTimer = 0
 let endWatch = 0
 let elapsedTimer = 0
+let fadeTimer = 0
+let fadeRaf = 0
 let startedAt = 0
 let endMisses = 0
 let ending = false
 /** @type {null | ((e: Event) => void)} */
 let busListener = null
+let lastGhostKey = ''
 
 function formatElapsed(sec) {
   const s = Math.max(0, Math.floor(sec))
@@ -133,6 +147,17 @@ function clickCoreStart() {
   return false
 }
 
+function clearFadeTimers() {
+  if (fadeTimer) {
+    clearTimeout(fadeTimer)
+    fadeTimer = 0
+  }
+  if (fadeRaf) {
+    cancelAnimationFrame(fadeRaf)
+    fadeRaf = 0
+  }
+}
+
 function clearTimersSoft() {
   if (elapsedTimer) {
     clearInterval(elapsedTimer)
@@ -142,6 +167,73 @@ function clearTimersSoft() {
     clearTimeout(endWatch)
     endWatch = 0
   }
+  clearFadeTimers()
+}
+
+function clearGhost() {
+  clearFadeTimers()
+  $ghostText.set('')
+  $ghostRole.set('')
+  $ghostOpacity.set(0)
+  lastGhostKey = ''
+}
+
+/**
+ * Show ephemeral words then fade them away (ChatGPT/Grok orb pattern:
+ * speech is felt in the orb; text is temporary).
+ * @param {string} text
+ * @param {'you' | 'agent'} role
+ * @param {{ sticky?: boolean }} [opts] sticky = hold while still streaming (partials)
+ */
+function showGhostWords(text, role, opts = {}) {
+  const t = (text || '').trim()
+  if (!t) return
+  const key = `${role}:${t}`
+  const sticky = Boolean(opts.sticky)
+
+  // Same partial growing — refresh opacity without restarting full hold if already visible
+  if (key === lastGhostKey && sticky) {
+    $ghostOpacity.set(1)
+    scheduleFade(true)
+    return
+  }
+  if (key === lastGhostKey && !sticky && $ghostOpacity.get() > 0.5) {
+    scheduleFade(false)
+    return
+  }
+
+  lastGhostKey = key
+  $ghostText.set(t)
+  $ghostRole.set(role)
+  $ghostOpacity.set(1)
+  scheduleFade(sticky)
+}
+
+function scheduleFade(extendOnly) {
+  clearFadeTimers()
+  const hold = extendOnly ? WORD_HOLD_MS : WORD_HOLD_MS
+  fadeTimer = window.setTimeout(() => {
+    fadeTimer = 0
+    const start = performance.now()
+    const from = $ghostOpacity.get()
+    const tick = now => {
+      const u = Math.min(1, (now - start) / WORD_FADE_MS)
+      const next = from * (1 - u)
+      $ghostOpacity.set(next)
+      if (u < 1 && lastGhostKey) {
+        fadeRaf = requestAnimationFrame(tick)
+      } else {
+        fadeRaf = 0
+        if (u >= 1) {
+          $ghostText.set('')
+          $ghostRole.set('')
+          $ghostOpacity.set(0)
+          lastGhostKey = ''
+        }
+      }
+    }
+    fadeRaf = requestAnimationFrame(tick)
+  }, hold)
 }
 
 function resetSessionUi() {
@@ -152,6 +244,7 @@ function resetSessionUi() {
   $captionPartial.set(false)
   $agentLine.set('')
   $mode.set('off')
+  clearGhost()
   endMisses = 0
   ending = false
   setLiveAttr(false)
@@ -194,6 +287,7 @@ function startVoice() {
   haptic('open')
   $caption.set('')
   $agentLine.set('')
+  clearGhost()
   if (!clickCoreStart()) dispatchVoiceToggle()
 }
 
@@ -206,7 +300,7 @@ function toggleVoice() {
   } else startVoice()
 }
 
-// --- Native voice bus (Desktop Whisper / same as dictation) ------------------
+// --- Native voice bus --------------------------------------------------------
 
 function onVoiceBus(ev) {
   const d = ev?.detail
@@ -224,8 +318,13 @@ function onVoiceBus(ev) {
   }
 
   if (typeof d.caption === 'string' && d.caption.trim()) {
-    $caption.set(d.caption.trim())
+    const cap = d.caption.trim()
+    $caption.set(cap)
     $captionPartial.set(Boolean(d.partial))
+    // YOU words: show while listening/recording/transcribing, then fade
+    if (phase === 'listening' || phase === 'recording' || phase === 'transcribing') {
+      showGhostWords(cap, 'you', { sticky: Boolean(d.partial) })
+    }
   }
 
   if (active && !$nativeActive.get()) {
@@ -236,7 +335,6 @@ function onVoiceBus(ev) {
   }
 
   if (!active && $nativeActive.get() && !findCoreEndButton()) {
-    // Bus says off and core pill gone
     $nativeActive.set(false)
     resetSessionUi()
     return
@@ -245,6 +343,7 @@ function onVoiceBus(ev) {
   if (active) {
     $nativeActive.set(true)
     setLiveAttr(true)
+    const prev = $phase.get()
     if (phase === 'recording') $phase.set('listening')
     else if (
       phase === 'listening' ||
@@ -255,11 +354,21 @@ function onVoiceBus(ev) {
     ) {
       $phase.set(phase === 'idle' ? 'listening' : phase)
     }
-    if (phase === 'listening' || phase === 'recording') {
-      // keep caption growing from partials; clear only on fresh listen with empty caption
-      if (d.caption === '' || d.caption === undefined) {
-        /* leave existing partials */
-      }
+
+    // Phase transitions that clear / retarget words
+    if (phase === 'speaking' && prev !== 'speaking') {
+      // Orb takes over — fade YOU words immediately
+      scheduleFade(false)
+    }
+    if (phase === 'listening' && (prev === 'speaking' || prev === 'thinking')) {
+      $caption.set('')
+      $agentLine.set('')
+      // fresh listen — ghost clear
+      clearGhost()
+    }
+    if (phase === 'thinking' && prev === 'transcribing') {
+      // brief hold then fade committed YOU caption
+      if ($caption.get()) showGhostWords($caption.get(), 'you', { sticky: false })
     }
   }
 }
@@ -276,17 +385,11 @@ function unwireVoiceBus() {
   busListener = null
 }
 
-// Fallback DOM detect if older Desktop without bus (session active only)
-function findCoreEndFallback() {
-  return findCoreEndButton()
-}
-
 function wireDomFallback() {
   if (pollTimer) return
   pollTimer = window.setInterval(() => {
     if (ending) return
-    // Prefer bus; DOM only keeps session alive / detects End
-    const endBtn = findCoreEndFallback()
+    const endBtn = findCoreEndButton()
     if (endBtn) {
       endMisses = 0
       if (!$nativeActive.get()) {
@@ -298,7 +401,6 @@ function wireDomFallback() {
           $error.set('')
         }
       }
-      // scrape level bars if bus not sending levels
       if (!$busOk.get()) {
         const bars = endBtn.querySelectorAll('span.w-0\\.5, span[class*="w-0.5"]')
         if (bars.length) {
@@ -336,6 +438,19 @@ function ensureCss() {
 [data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
   display: none !important;
 }
+[data-voice-hud="1"] .vh-ghost {
+  transition: opacity 0.35s ease, transform 0.45s ease;
+  will-change: opacity, transform;
+}
+[data-voice-hud="1"] .vh-orb-shell {
+  filter: drop-shadow(0 0 18px rgba(56, 189, 248, 0.22));
+}
+[data-voice-hud="1"][data-vh-phase="speaking"] .vh-orb-shell {
+  filter: drop-shadow(0 0 28px rgba(96, 165, 250, 0.45));
+}
+[data-voice-hud="1"][data-vh-phase="listening"] .vh-orb-shell {
+  filter: drop-shadow(0 0 20px rgba(52, 211, 153, 0.28));
+}
 `
 }
 
@@ -363,25 +478,36 @@ function wireGateway() {
     if (type === 'message.start') {
       $agentLine.set('')
       $phase.set('thinking')
+      // thinking: orb only — fade residual YOU text
+      scheduleFade(false)
     } else if (type === 'message.delta') {
       const chunk = String(payload.text || payload.delta || '')
       if (!chunk) return
-      $agentLine.set(($agentLine.get() + chunk).slice(-280))
+      const next = ($agentLine.get() + chunk).slice(-320)
+      $agentLine.set(next)
       $phase.set('speaking')
+      // Brief ghost of agent words then they disappear — orb is the voice
+      showGhostWords(next.slice(-160), 'agent', { sticky: true })
     } else if (type === 'message.complete') {
       $agentLine.set('')
+      // Final fade-out of agent words
+      scheduleFade(false)
       if (findCoreEndButton() || $nativeActive.get()) {
         $phase.set('listening')
         $caption.set('')
         $captionPartial.set(false)
+        // After a beat, clear ghost fully for clean listen
+        window.setTimeout(() => {
+          if ($phase.get() === 'listening') clearGhost()
+        }, WORD_HOLD_MS + WORD_FADE_MS)
       }
     }
   })
 }
 
-// --- UI ----------------------------------------------------------------------
+// --- Orb (primary UI — AI “speaks through” this) -----------------------------
 
-function MiniOrb({ size = 26 }) {
+function VoiceOrb({ size = 88 }) {
   const ref = useRef(null)
   const level = useValue($level)
   const phase = useValue($phase)
@@ -397,60 +523,111 @@ function MiniOrb({ size = 26 }) {
     if (!ctx) return
     let raf = 0
     const t0 = performance.now()
-    const dpr = Math.max(1, window.devicePixelRatio || 1)
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
     c.width = Math.round(size * dpr)
     c.height = Math.round(size * dpr)
     c.style.width = size + 'px'
     c.style.height = size + 'px'
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    const N = 28
+    const FIBERS = 42
+
     const draw = now => {
       const t = (now - t0) / 1000
       const cx = size / 2
       const cy = size / 2
       const ph = pr.current
       const lv = lr.current
-      const base = ph === 'listening' ? 0.42 : ph === 'speaking' ? 0.5 : 0.22
-      const amp = base + lv * 0.55
+
+      // Phase personality (ChatGPT/Grok-like state motion)
+      let base = 0.22
+      let speed = 0.55
+      let hueA = 200
+      let hueB = 260
+      if (ph === 'listening' || ph === 'recording') {
+        base = 0.38
+        speed = 0.9
+        hueA = 160
+        hueB = 200
+      } else if (ph === 'transcribing' || ph === 'thinking') {
+        base = 0.28
+        speed = 1.35
+        hueA = 45
+        hueB = 200
+      } else if (ph === 'speaking') {
+        base = 0.52
+        speed = 1.15
+        hueA = 210
+        hueB = 280
+      }
+      const amp = base + lv * 0.62
+      const breathe = 1 + Math.sin(t * speed * 2.2) * 0.04 * (ph === 'speaking' ? 1.4 : 1)
+
       ctx.clearRect(0, 0, size, size)
-      const g = ctx.createRadialGradient(cx, cy, 1, cx, cy, size * 0.48)
-      g.addColorStop(0, `hsla(200,100%,58%,${0.35 + amp * 0.35})`)
-      g.addColorStop(0.55, `hsla(145,90%,48%,${0.16 + amp * 0.18})`)
-      g.addColorStop(1, 'hsla(48,90%,55%,0)')
-      ctx.fillStyle = g
+
+      // Soft outer glow
+      const glowR = size * 0.48 * breathe
+      const glow = ctx.createRadialGradient(cx, cy, size * 0.08, cx, cy, glowR)
+      glow.addColorStop(0, `hsla(${hueA},95%,62%,${0.55 + amp * 0.35})`)
+      glow.addColorStop(0.45, `hsla(${(hueA + hueB) / 2},90%,50%,${0.22 + amp * 0.2})`)
+      glow.addColorStop(1, `hsla(${hueB},80%,40%,0)`)
+      ctx.fillStyle = glow
       ctx.beginPath()
-      ctx.arc(cx, cy, size * 0.48, 0, Math.PI * 2)
+      ctx.arc(cx, cy, glowR, 0, Math.PI * 2)
       ctx.fill()
-      for (let i = 0; i < N; i++) {
-        const hue = 188 + (i / N) * 150 + t * 48
-        const a0 = (i / N) * Math.PI * 2 + t * 0.8
+
+      // Core sphere
+      const coreR = size * (0.22 + amp * 0.06) * breathe
+      const core = ctx.createRadialGradient(cx - coreR * 0.25, cy - coreR * 0.3, 1, cx, cy, coreR)
+      core.addColorStop(0, `hsla(${hueA},100%,88%,${0.95})`)
+      core.addColorStop(0.45, `hsla(${hueA},90%,58%,${0.75})`)
+      core.addColorStop(1, `hsla(${hueB},85%,35%,${0.35})`)
+      ctx.fillStyle = core
+      ctx.beginPath()
+      ctx.arc(cx, cy, coreR, 0, Math.PI * 2)
+      ctx.fill()
+
+      // Torus fibers (Iron Man / advanced voice texture)
+      for (let i = 0; i < FIBERS; i++) {
+        const hue = hueA + (i / FIBERS) * (hueB - hueA) + t * 40
+        const a0 = (i / FIBERS) * Math.PI * 2 + t * speed * 0.7
         ctx.beginPath()
-        for (let s = 0; s <= 10; s++) {
-          const u = s / 10
+        for (let s = 0; s <= 14; s++) {
+          const u = s / 14
           const r =
-            size * (0.1 + u * 0.22) + Math.sin(t * 3.8 + i + u * 5) * size * 0.035 * amp
-          const a = a0 + u * 1.55
+            size * (0.14 + u * 0.28) * breathe +
+            Math.sin(t * 3.2 * speed + i * 0.4 + u * 6) * size * 0.04 * amp
+          const a = a0 + u * 1.7 + Math.sin(t + i) * 0.08 * amp
           const x = cx + Math.cos(a) * r
-          const y = cy + Math.sin(a) * r
+          const y = cy + Math.sin(a) * r * (0.92 + amp * 0.08)
           if (s === 0) ctx.moveTo(x, y)
           else ctx.lineTo(x, y)
         }
-        ctx.strokeStyle = `hsla(${hue % 360},90%,58%,${0.18 + amp * 0.38})`
-        ctx.lineWidth = 0.7
+        ctx.strokeStyle = `hsla(${hue % 360},92%,62%,${0.14 + amp * 0.42})`
+        ctx.lineWidth = 0.85 + amp * 0.5
         ctx.stroke()
       }
+
+      // Specular highlight
+      ctx.fillStyle = `hsla(0,0%,100%,${0.18 + amp * 0.12})`
+      ctx.beginPath()
+      ctx.ellipse(cx - coreR * 0.28, cy - coreR * 0.32, coreR * 0.22, coreR * 0.14, -0.5, 0, Math.PI * 2)
+      ctx.fill()
+
       raf = requestAnimationFrame(draw)
     }
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
   }, [size])
 
-  return jsx('canvas', { ref, 'aria-hidden': true, className: 'block shrink-0' })
+  return jsx('canvas', {
+    ref,
+    'aria-hidden': true,
+    className: 'vh-orb-shell block mx-auto'
+  })
 }
 
 function phaseLabel(p) {
-  if (p === 'listening') return 'Listening'
-  if (p === 'recording') return 'Dictating'
+  if (p === 'listening' || p === 'recording') return 'Listening'
   if (p === 'transcribing') return 'Got it'
   if (p === 'thinking') return 'Thinking'
   if (p === 'speaking') return 'Speaking'
@@ -460,14 +637,12 @@ function phaseLabel(p) {
 function LiveStrip() {
   const active = useValue($nativeActive)
   const phase = useValue($phase)
-  const caption = useValue($caption)
-  const captionPartial = useValue($captionPartial)
-  const agentLine = useValue($agentLine)
+  const ghostText = useValue($ghostText)
+  const ghostRole = useValue($ghostRole)
+  const ghostOpacity = useValue($ghostOpacity)
   const elapsed = useValue($elapsed)
   const error = useValue($error)
-  const level = useValue($level)
   const busOk = useValue($busOk)
-  const mode = useValue($mode)
 
   if (!active) {
     if (error) {
@@ -481,94 +656,52 @@ function LiveStrip() {
   }
 
   const listening = phase === 'listening' || phase === 'recording'
-  const showAgent = phase === 'speaking' && agentLine
+  const speaking = phase === 'speaking'
+  // Orb grows when AI speaks — primary focus
+  const orbSize = speaking ? 104 : listening ? 88 : 76
 
-  let mainLabel = 'YOU'
-  let mainText = ''
-  let mainLive = false
-
-  if (listening) {
-    mainLabel = 'YOU'
-    if (caption) {
-      mainText = caption
-      mainLive = captionPartial || true
-    } else if (!busOk) {
-      mainText = 'Listening… (reload Desktop for native live captions)'
-      mainLive = true
-    } else {
-      mainText = 'Listening…'
-      mainLive = true
-    }
-  } else if (phase === 'transcribing' || phase === 'thinking') {
-    mainLabel = 'YOU'
-    mainText = caption || '…'
-    mainLive = false
-  } else if (showAgent) {
-    mainLabel = 'HERMES'
-    mainText = agentLine
-    mainLive = true
-  } else {
-    mainText = caption || phaseLabel(phase)
-  }
+  const showGhost = Boolean(ghostText) && ghostOpacity > 0.02
 
   return jsxs('div', {
     className: cn(
-      'mb-0.5 flex flex-col gap-1.5 rounded-xl border px-2.5 py-2',
-      'border-border/50 bg-muted/35 text-muted-foreground',
-      'shadow-[inset_0_1px_0_rgba(255,255,255,0.18)] backdrop-blur-sm',
-      phase === 'speaking' && 'border-primary/20 bg-primary/6'
+      'mb-0.5 flex flex-col items-center gap-2 rounded-2xl border px-3 py-3',
+      'border-border/40 bg-muted/30 text-muted-foreground',
+      'shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-md',
+      speaking && 'border-primary/25 bg-primary/5',
+      listening && 'border-emerald-500/20'
     ),
     role: 'status',
     'aria-live': 'polite',
     'data-voice-hud': '1',
+    'data-vh-phase': phase,
     children: [
+      // Top chrome: minimal
       jsxs('div', {
-        className: 'flex h-7 items-center gap-2',
+        className: 'flex w-full items-center justify-between gap-2 px-0.5',
         children: [
-          jsx('span', {
-            className: cn(
-              'size-1.5 shrink-0 rounded-full',
-              listening
-                ? 'animate-pulse bg-green-400'
-                : phase === 'speaking'
-                  ? 'animate-pulse bg-primary'
-                  : 'bg-amber-400'
-            )
+          jsxs('div', {
+            className: 'flex items-center gap-1.5 text-[0.65rem] text-muted-foreground/70',
+            children: [
+              jsx('span', {
+                className: cn(
+                  'size-1.5 rounded-full',
+                  listening
+                    ? 'animate-pulse bg-emerald-400'
+                    : speaking
+                      ? 'animate-pulse bg-sky-400'
+                      : 'bg-amber-400/90'
+                )
+              }),
+              jsx('span', {
+                className: 'font-medium tracking-wide text-foreground/75',
+                children: phaseLabel(phase)
+              }),
+              jsx('span', {
+                className: 'font-mono tabular-nums opacity-60',
+                children: formatElapsed(elapsed / 1000)
+              })
+            ]
           }),
-          jsx('span', {
-            className: 'shrink-0 text-[0.7rem] font-medium text-foreground/90',
-            children: phaseLabel(phase)
-          }),
-          jsx('span', {
-            className: 'font-mono text-[0.62rem] tabular-nums text-muted-foreground/75',
-            children: formatElapsed(elapsed / 1000)
-          }),
-          jsxs('span', {
-            'aria-hidden': true,
-            className: 'flex h-3 items-end gap-0.5',
-            children: [0.2, 0.4, 0.6, 0.8, 1].map((th, i) =>
-              jsx(
-                'span',
-                {
-                  className: cn(
-                    'w-0.5 rounded-full transition-[height] duration-75',
-                    level >= th * 0.45 ? 'bg-primary' : 'bg-muted-foreground/25'
-                  ),
-                  style: { height: `${26 + th * 74}%` }
-                },
-                i
-              )
-            )
-          }),
-          jsx('span', {
-            className: 'min-w-0 flex-1 truncate text-[0.62rem] text-muted-foreground/55',
-            children: busOk
-              ? mode === 'dictation'
-                ? 'Native dictate STT'
-                : 'Native voice STT'
-              : 'Waiting for Desktop voice bus'
-          }),
-          jsx(MiniOrb, { size: 26 }),
           jsx(Button, {
             type: 'button',
             size: 'sm',
@@ -585,36 +718,52 @@ function LiveStrip() {
           })
         ]
       }),
-      jsxs('div', {
+
+      // THE ORB — AI speaks through this
+      jsx('div', {
         className: cn(
-          'min-h-[2.25rem] rounded-lg border px-2.5 py-1.5',
-          mainLabel === 'YOU'
-            ? 'border-(--ui-stroke-tertiary) bg-background/40'
-            : 'border-primary/15 bg-primary/5'
+          'flex items-center justify-center py-1 transition-[min-height] duration-300',
+          speaking ? 'min-h-[7.25rem]' : 'min-h-[6rem]'
         ),
-        children: [
-          jsxs('div', {
-            className:
-              'mb-0.5 flex items-center gap-1.5 text-[0.55rem] font-medium uppercase tracking-[0.14em] text-(--ui-text-quaternary)',
-            children: [
-              mainLabel,
-              mainLive
-                ? jsx('span', {
-                    className: 'normal-case tracking-normal text-primary',
-                    children: captionPartial ? 'live' : 'live'
-                  })
-                : null
-            ]
-          }),
-          jsx('div', {
-            className: cn(
-              'text-[0.9rem] leading-snug text-foreground',
-              caption && 'font-medium',
-              listening && !caption && 'text-muted-foreground/70'
-            ),
-            children: mainText
-          })
-        ]
+        children: jsx(VoiceOrb, { size: orbSize })
+      }),
+
+      // Ephemeral words — appear then disappear (not a chat log)
+      jsx('div', {
+        className: 'vh-ghost flex min-h-[1.75rem] w-full max-w-lg flex-col items-center justify-center px-2',
+        style: {
+          opacity: showGhost ? ghostOpacity : 0,
+          transform: showGhost ? `translateY(${(1 - ghostOpacity) * 6}px)` : 'translateY(4px)'
+        },
+        'aria-hidden': !showGhost,
+        children: showGhost
+          ? jsxs('div', {
+              className: 'text-center',
+              children: [
+                jsx('div', {
+                  className:
+                    'mb-0.5 text-[0.55rem] font-medium uppercase tracking-[0.16em] text-(--ui-text-quaternary)',
+                  children: ghostRole === 'agent' ? 'ILO' : 'YOU'
+                }),
+                jsx('div', {
+                  className: cn(
+                    'line-clamp-2 text-[0.88rem] leading-snug',
+                    ghostRole === 'agent' ? 'text-sky-100/90' : 'text-foreground/90'
+                  ),
+                  children: ghostText
+                })
+              ]
+            })
+          : jsx('div', {
+              className: 'text-[0.7rem] text-muted-foreground/45',
+              children: !busOk
+                ? 'Orb mode · waiting for Desktop voice bus'
+                : speaking
+                  ? ''
+                  : listening
+                    ? 'Speak — words fade, orb stays'
+                    : ''
+            })
       })
     ]
   })
@@ -625,8 +774,8 @@ function StatusChip() {
   const phase = useValue($phase)
   return jsx(Tip, {
     label: active
-      ? 'Native Desktop voice captions — Stop ends session'
-      : 'Voice HUD skins Desktop dictation/conversation STT. Settings → Plugins.',
+      ? 'Orb voice skin — Stop ends session'
+      : 'Voice HUD: ChatGPT/Grok-style orb. Settings → Plugins.',
     children: jsx('button', {
       type: 'button',
       className: cn(
@@ -639,7 +788,7 @@ function StatusChip() {
       },
       children: jsx(Badge, {
         variant: active ? 'default' : 'muted',
-        children: active ? `hud ${phase}` : 'hud'
+        children: active ? `orb ${phase}` : 'orb'
       })
     })
   })
@@ -674,8 +823,8 @@ export default {
         data: {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle native voice',
-          keywords: ['voice', 'hud', 'dictation', 'caption'],
+          label: 'Voice HUD: Toggle orb voice',
+          keywords: ['voice', 'hud', 'orb', 'chatgpt', 'grok'],
           run: () => toggleVoice()
         }
       },
@@ -694,7 +843,7 @@ export default {
         area: KEYBINDS_AREA,
         data: {
           id: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle native voice',
+          label: 'Voice HUD: Toggle orb voice',
           category: 'Voice',
           defaults: ['mod+shift+v'],
           run: () => toggleVoice()

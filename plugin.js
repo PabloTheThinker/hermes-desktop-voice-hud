@@ -36,12 +36,14 @@ const PLUGIN_ID = 'voice-hud'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
 const VOICE_BUS_EVENT = 'hermes:voice-bus'
 const STYLE_ID = 'voice-hud-css'
-const END_MISS_TOLERANCE = 5
+const END_MISS_TOLERANCE = 12
 const CORE_END_RE = /end voice conversation/i
 /** How long ephemeral words stay fully visible before fade. */
-const WORD_HOLD_MS = 1400
+const WORD_HOLD_MS = 1200
 /** Fade duration (CSS matches). */
-const WORD_FADE_MS = 900
+const WORD_FADE_MS = 800
+/** Keep session overlay up while bus/core says active. */
+const SESSION_HOLD_MS = 2500
 
 /** @typedef {'idle' | 'listening' | 'recording' | 'transcribing' | 'thinking' | 'speaking'} Phase */
 
@@ -335,8 +337,8 @@ function onVoiceBus(ev) {
   }
 
   if (!active && $nativeActive.get() && !findCoreEndButton()) {
-    $nativeActive.set(false)
-    resetSessionUi()
+    // Bus off and no core pill — only tear down after a short hold so
+    // between-turn idle gaps do not collapse the full-session overlay.
     return
   }
 
@@ -387,11 +389,14 @@ function unwireVoiceBus() {
 
 function wireDomFallback() {
   if (pollTimer) return
+  let lastSeenLive = 0
   pollTimer = window.setInterval(() => {
     if (ending) return
     const endBtn = findCoreEndButton()
-    if (endBtn) {
+    const busAlive = $busOk.get() && $mode.get() !== 'off'
+    if (endBtn || busAlive) {
       endMisses = 0
+      lastSeenLive = Date.now()
       if (!$nativeActive.get()) {
         $nativeActive.set(true)
         startElapsed()
@@ -401,7 +406,7 @@ function wireDomFallback() {
           $error.set('')
         }
       }
-      if (!$busOk.get()) {
+      if (endBtn && !$busOk.get()) {
         const bars = endBtn.querySelectorAll('span.w-0\\.5, span[class*="w-0.5"]')
         if (bars.length) {
           const mid = bars[Math.floor(bars.length / 2)]
@@ -413,7 +418,13 @@ function wireDomFallback() {
       }
     } else if ($nativeActive.get()) {
       endMisses += 1
-      if (endMisses >= END_MISS_TOLERANCE && $mode.get() !== 'dictation') {
+      // Hold full-session overlay across turn gaps; only collapse after
+      // both core End and bus have been gone for a while.
+      if (
+        endMisses >= END_MISS_TOLERANCE &&
+        Date.now() - lastSeenLive > SESSION_HOLD_MS &&
+        $mode.get() !== 'dictation'
+      ) {
         $nativeActive.set(false)
         resetSessionUi()
       }
@@ -435,21 +446,58 @@ function ensureCss() {
     document.head.appendChild(el)
   }
   el.textContent = `
+/* Hide stock voice strip while orb session owns the surface */
 [data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
   display: none !important;
+}
+/* Soften message list so the session feels like Advanced Voice, not a log */
+[data-voice-hud-live="1"] [data-slot="messages"],
+[data-voice-hud-live="1"] [data-slot="thread"],
+[data-voice-hud-live="1"] main [data-session-scroll],
+html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
+  opacity: 0.14 !important;
+  filter: blur(1px);
+  pointer-events: none !important;
+  transition: opacity 0.35s ease, filter 0.35s ease;
+}
+[data-voice-hud="1"].vh-session {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 80 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  margin: 0 !important;
+  padding: 2rem 1.25rem 6.5rem !important;
+  border: none !important;
+  border-radius: 0 !important;
+  background:
+    radial-gradient(ellipse 70% 55% at 50% 42%, rgba(14, 165, 233, 0.14), transparent 70%),
+    radial-gradient(ellipse 90% 80% at 50% 100%, rgba(0,0,0,0.55), transparent 55%),
+    rgba(6, 10, 18, 0.78) !important;
+  backdrop-filter: blur(18px) saturate(1.15) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(1.15) !important;
+  box-shadow: none !important;
 }
 [data-voice-hud="1"] .vh-ghost {
   transition: opacity 0.35s ease, transform 0.45s ease;
   will-change: opacity, transform;
 }
 [data-voice-hud="1"] .vh-orb-shell {
-  filter: drop-shadow(0 0 18px rgba(56, 189, 248, 0.22));
+  filter: drop-shadow(0 0 28px rgba(56, 189, 248, 0.28));
 }
 [data-voice-hud="1"][data-vh-phase="speaking"] .vh-orb-shell {
-  filter: drop-shadow(0 0 28px rgba(96, 165, 250, 0.45));
+  filter: drop-shadow(0 0 42px rgba(96, 165, 250, 0.55));
 }
 [data-voice-hud="1"][data-vh-phase="listening"] .vh-orb-shell {
-  filter: drop-shadow(0 0 20px rgba(52, 211, 153, 0.28));
+  filter: drop-shadow(0 0 32px rgba(52, 211, 153, 0.35));
+}
+/* Keep composer dock usable above the overlay for Stop/core End */
+[data-voice-hud-live="1"] [data-slot="composer-root"],
+[data-voice-hud-live="1"] [data-slot="composer-dock"] {
+  position: relative;
+  z-index: 90 !important;
 }
 `
 }
@@ -657,30 +705,28 @@ function LiveStrip() {
 
   const listening = phase === 'listening' || phase === 'recording'
   const speaking = phase === 'speaking'
-  // Orb grows when AI speaks — primary focus
-  const orbSize = speaking ? 104 : listening ? 88 : 76
+  // Full-session orb — larger when AI speaks (ChatGPT/Grok pattern)
+  const orbSize = speaking ? 168 : listening ? 148 : 128
 
   const showGhost = Boolean(ghostText) && ghostOpacity > 0.02
 
   return jsxs('div', {
     className: cn(
-      'mb-0.5 flex flex-col items-center gap-2 rounded-2xl border px-3 py-3',
-      'border-border/40 bg-muted/30 text-muted-foreground',
-      'shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-md',
-      speaking && 'border-primary/25 bg-primary/5',
-      listening && 'border-emerald-500/20'
+      'vh-session flex flex-col items-center gap-4',
+      'text-muted-foreground'
     ),
     role: 'status',
     'aria-live': 'polite',
     'data-voice-hud': '1',
     'data-vh-phase': phase,
     children: [
-      // Top chrome: minimal
+      // Top chrome: minimal floating bar
       jsxs('div', {
-        className: 'flex w-full items-center justify-between gap-2 px-0.5',
+        className:
+          'absolute top-4 left-1/2 z-[1] flex w-[min(28rem,calc(100%-2rem))] -translate-x-1/2 items-center justify-between gap-2 rounded-full border border-white/10 bg-black/35 px-3 py-1.5 backdrop-blur-md',
         children: [
           jsxs('div', {
-            className: 'flex items-center gap-1.5 text-[0.65rem] text-muted-foreground/70',
+            className: 'flex items-center gap-1.5 text-[0.7rem] text-white/70',
             children: [
               jsx('span', {
                 className: cn(
@@ -693,12 +739,16 @@ function LiveStrip() {
                 )
               }),
               jsx('span', {
-                className: 'font-medium tracking-wide text-foreground/75',
+                className: 'font-medium tracking-wide text-white/85',
                 children: phaseLabel(phase)
               }),
               jsx('span', {
                 className: 'font-mono tabular-nums opacity-60',
                 children: formatElapsed(elapsed / 1000)
+              }),
+              jsx('span', {
+                className: 'hidden text-[0.62rem] text-white/40 sm:inline',
+                children: busOk ? 'session' : 'arming…'
               })
             ]
           }),
@@ -706,7 +756,7 @@ function LiveStrip() {
             type: 'button',
             size: 'sm',
             variant: 'ghost',
-            className: 'h-6 shrink-0 rounded-full px-2.5 text-[0.68rem]',
+            className: 'h-7 shrink-0 rounded-full px-3 text-[0.72rem] text-white/85 hover:bg-white/10',
             'aria-label': 'Stop voice HUD',
             'data-voice-hud-end': '1',
             onClick: e => {
@@ -719,21 +769,22 @@ function LiveStrip() {
         ]
       }),
 
-      // THE ORB — AI speaks through this
+      // THE ORB — fills the session stage
       jsx('div', {
         className: cn(
-          'flex items-center justify-center py-1 transition-[min-height] duration-300',
-          speaking ? 'min-h-[7.25rem]' : 'min-h-[6rem]'
+          'flex flex-1 items-center justify-center transition-transform duration-500',
+          speaking ? 'scale-105' : 'scale-100'
         ),
         children: jsx(VoiceOrb, { size: orbSize })
       }),
 
-      // Ephemeral words — appear then disappear (not a chat log)
+      // Ephemeral words — appear then disappear
       jsx('div', {
-        className: 'vh-ghost flex min-h-[1.75rem] w-full max-w-lg flex-col items-center justify-center px-2',
+        className:
+          'vh-ghost flex min-h-[3.5rem] w-full max-w-xl flex-col items-center justify-center px-4 pb-2',
         style: {
           opacity: showGhost ? ghostOpacity : 0,
-          transform: showGhost ? `translateY(${(1 - ghostOpacity) * 6}px)` : 'translateY(4px)'
+          transform: showGhost ? `translateY(${(1 - ghostOpacity) * 8}px)` : 'translateY(6px)'
         },
         'aria-hidden': !showGhost,
         children: showGhost
@@ -742,27 +793,27 @@ function LiveStrip() {
               children: [
                 jsx('div', {
                   className:
-                    'mb-0.5 text-[0.55rem] font-medium uppercase tracking-[0.16em] text-(--ui-text-quaternary)',
+                    'mb-1 text-[0.58rem] font-medium uppercase tracking-[0.18em] text-white/40',
                   children: ghostRole === 'agent' ? 'ILO' : 'YOU'
                 }),
                 jsx('div', {
                   className: cn(
-                    'line-clamp-2 text-[0.88rem] leading-snug',
-                    ghostRole === 'agent' ? 'text-sky-100/90' : 'text-foreground/90'
+                    'line-clamp-3 text-[1.05rem] leading-snug',
+                    ghostRole === 'agent' ? 'text-sky-100/90' : 'text-white/90'
                   ),
                   children: ghostText
                 })
               ]
             })
           : jsx('div', {
-              className: 'text-[0.7rem] text-muted-foreground/45',
+              className: 'text-center text-[0.78rem] text-white/35',
               children: !busOk
-                ? 'Orb mode · waiting for Desktop voice bus'
+                ? 'Full session · waiting for Desktop voice bus'
                 : speaking
                   ? ''
                   : listening
-                    ? 'Speak — words fade, orb stays'
-                    : ''
+                    ? 'Speak anytime — continuous session'
+                    : phaseLabel(phase)
             })
       })
     ]

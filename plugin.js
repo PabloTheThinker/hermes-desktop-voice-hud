@@ -488,9 +488,7 @@ function wireGateway() {
       const next = ($agentLine.get() + chunk).slice(-420)
       $agentLine.set(next)
       $phase.set('speaking')
-      showGhostWords(next.slice(-220), 'agent', { sticky: true })
     } else if (type === 'message.complete') {
-      if ($agentLine.get()) showGhostWords($agentLine.get().slice(-220), 'agent', { sticky: false })
       $agentLine.set('')
       if (findCoreEndButton() || $nativeActive.get()) $phase.set('listening')
       paintHud()
@@ -509,11 +507,11 @@ function ensureCss() {
     document.head.appendChild(el)
   }
   el.textContent = `
-/* Hide stock voice strip only */
+/* Hide stock voice status strip (we own the voice chrome) */
 [data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
   display: none !important;
 }
-/* Conversation stays fully readable */
+/* Chat stays fully readable — no dim */
 [data-voice-hud-live="1"] [data-slot="messages"],
 [data-voice-hud-live="1"] [data-slot="thread"],
 [data-voice-hud-live="1"] [data-slot="chat-scroll"] {
@@ -521,108 +519,127 @@ function ensureCss() {
   filter: none !important;
   pointer-events: auto !important;
 }
+/* Soft bottom fade so messages don't collide with the voice dock */
+[data-voice-hud-live="1"] [data-slot="composer-root"],
+[data-voice-hud-live="1"] [data-slot="composer-dock"] {
+  position: relative;
+  z-index: 5;
+}
 
-/* Bare orb + controls integrated in the session message area */
+/* ChatGPT-style voice dock: sits ABOVE composer only — never over message bubbles */
 #${ROOT_ID} {
   position: fixed;
-  z-index: 70;
+  z-index: 60;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
+  justify-content: center;
+  gap: 8px;
   pointer-events: none;
   background: transparent;
   border: none;
   box-shadow: none;
-  padding: 0;
+  padding: 0 12px 4px;
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 #${ROOT_ID} > * { pointer-events: auto; }
 
-#${ROOT_ID} .vh-caption {
-  max-width: min(28rem, 90%);
-  text-align: center;
-  min-height: 1.25rem;
-  padding: 0 12px;
-  text-shadow: 0 1px 14px rgba(0,0,0,0.55), 0 0 1px rgba(0,0,0,0.4);
-}
-#${ROOT_ID} .vh-role {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  margin-bottom: 3px;
-}
-#${ROOT_ID} .vh-role.you { color: rgba(110, 231, 183, 0.95); }
-#${ROOT_ID} .vh-role.agent { color: rgba(125, 211, 252, 0.95); }
-#${ROOT_ID} .vh-text {
-  font-size: 14px;
-  font-weight: 500;
-  line-height: 1.35;
+/* Tiny phase chip — not a transcript overlay */
+#${ROOT_ID} .vh-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(12, 14, 20, 0.45);
+  border: 1px solid rgba(255,255,255,0.08);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  font-size: 11px;
+  font-weight: 600;
   letter-spacing: -0.01em;
-  color: rgba(248, 250, 252, 0.96);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  color: rgba(226, 232, 240, 0.88);
 }
-#${ROOT_ID} .vh-hint {
-  font-size: 12px;
+#${ROOT_ID} .vh-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  background: #34c759;
+  box-shadow: 0 0 0 3px rgba(52,199,89,0.16);
+}
+#${ROOT_ID} .vh-dot[data-on="speak"] {
+  background: #0a84ff;
+  box-shadow: 0 0 0 3px rgba(10,132,255,0.18);
+}
+#${ROOT_ID} .vh-dot[data-on="think"] {
+  background: #ff9f0a;
+  box-shadow: 0 0 0 3px rgba(255,159,10,0.16);
+}
+#${ROOT_ID} .vh-chip .vh-time {
   font-weight: 500;
-  color: rgba(203, 213, 225, 0.72);
-  text-shadow: 0 1px 10px rgba(0,0,0,0.45);
+  font-variant-numeric: tabular-nums;
+  color: rgba(148, 163, 184, 0.95);
 }
 
 #${ROOT_ID} .vh-orb-wrap {
   display: flex;
   align-items: center;
   justify-content: center;
+  line-height: 0;
 }
 
+/* Control row — ChatGPT: mic · speaker · end */
 #${ROOT_ID} .vh-ctrls {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  gap: 16px;
+  padding: 2px 0 0;
 }
 #${ROOT_ID} .vh-btn {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   border-radius: 999px;
   border: none;
-  background: rgba(15, 18, 28, 0.28);
+  background: rgba(15, 18, 28, 0.35);
   color: rgba(241, 245, 249, 0.92);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   transition: background 140ms ease, opacity 140ms ease, transform 140ms ease;
 }
-#${ROOT_ID} .vh-btn:hover {
-  background: rgba(15, 18, 28, 0.45);
-}
+#${ROOT_ID} .vh-btn:hover { background: rgba(15, 18, 28, 0.55); }
 #${ROOT_ID} .vh-btn:active { transform: scale(0.96); }
-#${ROOT_ID} .vh-btn[data-on="1"] { opacity: 0.42; }
+#${ROOT_ID} .vh-btn[data-on="1"] { opacity: 0.4; }
 #${ROOT_ID} .vh-btn.vh-end { color: rgba(252, 165, 165, 0.95); }
 
-/* Kill old chrome variants */
+/* NO big caption over chat — legacy nodes hidden */
+#${ROOT_ID} .vh-caption { display: none !important; }
+
 #voice-hud-live-portal,
 #voice-hud-mac-panel { display: none !important; }
 `
 }
 
-function getSessionRect() {
-  // Prefer the message/conversation surface, not whole desktop
+function getComposerRect() {
+  const el = document.querySelector('[data-slot="composer-root"], [data-slot="composer-dock"]')
+  if (el) {
+    const r = el.getBoundingClientRect()
+    if (r.width > 120) return r
+  }
+  return null
+}
+
+function getWorkspaceWidthRect() {
   const sels = [
     '[data-slot="chat-scroll"]',
     '[data-slot="messages"]',
-    '[data-slot="thread"]',
     '[data-slot="workspace"]',
     'main'
   ]
@@ -630,45 +647,45 @@ function getSessionRect() {
     const el = document.querySelector(s)
     if (!el) continue
     const r = el.getBoundingClientRect()
-    if (r.width > 200 && r.height > 160) return r
+    if (r.width > 200) return r
   }
-  // Fallback: area above composer
-  const composer = document.querySelector('[data-slot="composer-root"], [data-slot="composer-dock"]')
-  if (composer) {
-    const c = composer.getBoundingClientRect()
-    return {
-      left: c.left,
-      width: c.width,
-      top: Math.max(48, c.top - 420),
-      height: 420,
-      right: c.right,
-      bottom: c.top
-    }
-  }
-  return {
-    left: window.innerWidth * 0.18,
-    width: window.innerWidth * 0.64,
-    top: 80,
-    height: window.innerHeight * 0.7,
-    right: window.innerWidth * 0.82,
-    bottom: window.innerHeight * 0.78
-  }
+  return null
 }
 
+/**
+ * Dock the voice chrome tightly ABOVE the composer — ChatGPT desktop pattern.
+ * Never center mid-transcript (that caused caption/orb collision with bubbles).
+ */
 function layoutHud() {
   const root = document.getElementById(ROOT_ID)
   if (!root || !$nativeActive.get()) return
-  const r = getSessionRect()
-  // Sit in lower-center of the conversation area (above composer)
-  const width = Math.min(r.width, 420)
-  const left = r.left + (r.width - width) / 2
-  const bottomGap = 12
-  // Anchor bottom of HUD just above the bottom of the message area
-  const top = r.top + r.height - 168 - bottomGap
-  root.style.width = `${width}px`
-  root.style.left = `${Math.max(12, left)}px`
-  root.style.top = `${Math.max(56, Math.min(window.innerHeight - 180, top))}px`
-  root.style.height = '160px'
+
+  const composer = getComposerRect()
+  const workspace = getWorkspaceWidthRect()
+
+  const width = Math.min(
+    360,
+    (workspace?.width || composer?.width || window.innerWidth * 0.55) * 0.92
+  )
+  const leftBase = workspace?.left ?? composer?.left ?? window.innerWidth * 0.22
+  const fullW = workspace?.width ?? composer?.width ?? window.innerWidth * 0.56
+  const left = leftBase + (fullW - width) / 2
+
+  // Height of dock stack: chip + orb + controls ≈ 130px
+  const dockH = 132
+  const gap = 10
+  let top
+  if (composer) {
+    top = composer.top - dockH - gap
+  } else {
+    top = window.innerHeight - dockH - 96
+  }
+  top = Math.max(56, Math.min(top, window.innerHeight - dockH - 24))
+
+  root.style.width = `${Math.round(width)}px`
+  root.style.left = `${Math.round(Math.max(12, left))}px`
+  root.style.top = `${Math.round(top)}px`
+  root.style.height = `${dockH}px`
 }
 
 function svgMic(muted) {
@@ -699,28 +716,18 @@ function paintHud() {
   const root = document.getElementById(ROOT_ID)
   if (!root || !$nativeActive.get()) return
 
-  const cap = root.querySelector('[data-vh-caption]')
-  if (cap) {
-    const text = ($ghostText.get() || $caption.get() || '').trim()
-    const op = $ghostText.get() ? $ghostOpacity.get() : text ? 1 : 0
-    const role = $ghostText.get() ? $ghostRole.get() : text ? 'you' : ''
-    if (text && op > 0.05) {
-      cap.style.opacity = String(op)
-      cap.innerHTML = `<div class="vh-role ${role === 'agent' ? 'agent' : 'you'}">${
-        role === 'agent' ? 'ILO' : 'YOU'
-      }</div><div class="vh-text">${escapeHtml(text)}</div>`
-    } else {
-      const phase = $phase.get()
-      const listening = phase === 'listening' || phase === 'recording'
-      cap.style.opacity = '0.85'
-      cap.innerHTML = `<div class="vh-hint">${
-        !$busOk.get()
-          ? 'Starting…'
-          : listening
-            ? 'Listening'
-            : `${phaseLabel(phase)} · ${formatElapsed($elapsed.get() / 1000)}`
-      }</div>`
-    }
+  const phase = $phase.get()
+  const listening = phase === 'listening' || phase === 'recording'
+  const speaking = phase === 'speaking'
+  const thinking = phase === 'thinking' || phase === 'transcribing'
+  const dot = speaking ? 'speak' : thinking ? 'think' : 'listen'
+
+  const chip = root.querySelector('[data-vh-chip]')
+  if (chip) {
+    chip.innerHTML =
+      `<span class="vh-dot" data-on="${dot}"></span>` +
+      `<span>${phaseLabel(phase)}</span>` +
+      `<span class="vh-time">${formatElapsed($elapsed.get() / 1000)}</span>`
   }
 
   const mic = root.querySelector('[data-vh-mic]')
@@ -756,7 +763,7 @@ function startOrbLoop() {
     const speaking = phase === 'speaking'
     const listening = phase === 'listening' || phase === 'recording'
     // ChatGPT desktop scale — modest sphere in the conversation
-    const size = speaking ? 74 : listening ? 70 : 66
+    const size = speaking ? 64 : listening ? 60 : 56
     const pad = Math.round(size * 0.48)
     const W = size + pad * 2
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
@@ -833,7 +840,7 @@ function mountHud() {
     root.setAttribute('role', 'status')
     root.setAttribute('aria-live', 'polite')
     root.innerHTML = `
-      <div class="vh-caption" data-vh-caption></div>
+      <div class="vh-chip" data-vh-chip></div>
       <div class="vh-orb-wrap" data-vh-orb></div>
       <div class="vh-ctrls">
         <button type="button" class="vh-btn" data-vh-mic aria-label="Mute microphone" title="Mute mic"></button>

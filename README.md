@@ -1,40 +1,24 @@
 # Hermes Desktop Voice HUD
 
-Optional **in-composer** live layer for Hermes Desktop’s native voice conversation.
+Optional **skin** over Hermes Desktop native voice — continuous conversation chrome in the composer dock.
 
-Sits in the same dock as the typing bar: real-time transcript, mini orb, image chips, End. Uses the **existing** Desktop voice controls (no second mic).
+## Critical rule
 
-> Fan-inspired UI only. Not affiliated with Marvel / Disney / J.A.R.V.I.S.
+**Never opens the microphone.** Desktop already owns mic for:
 
-## Choice
+`listen → silence → STT → think → speak → listen again`
 
-`defaultEnabled: false` — turn on in **Settings → Plugins → Voice HUD**.
+A second `getUserMedia` / Web Speech capture was ending the session after turn 1 (`onFatalError`). This plugin only observes and paints.
 
-## What you get
+## Enable
 
-| Piece | Role |
-|--------|------|
-| **Live strip** (`composer.top`) | Real-time caption, phase, levels, mini orb, End |
-| **Images** | Thumbnails of staged composer attachments; middleware attaches them to voice turns when possible |
-| **Native voice** | Start with Desktop’s voice control (or status chip / Mod+Shift+V) |
-| **Hard stop** | End / stop-word → listening fully stops |
+Settings → Plugins → **Voice HUD** ON → Reload desktop plugins.
 
-No extra mic in the action row — stays clean with model · mic · wake · voice.
+## Use
 
-## Install
-
-```bash
-git clone https://github.com/PabloTheThinker/hermes-desktop-voice-hud.git
-cd hermes-desktop-voice-hud
-./install.sh
-```
-
-1. Settings → Plugins → **Voice HUD** ON  
-2. Reload desktop plugins  
-3. Attach images with **+** if needed  
-4. Start Desktop voice  
-5. Speak — live line updates in real time  
-6. **End** stops listening  
+1. Start voice with Desktop’s voice control (or status `hud` / Mod+Shift+V)
+2. Speak → pause → reply → **speak again** (continuous)
+3. **End** stops listening
 
 ## License
 

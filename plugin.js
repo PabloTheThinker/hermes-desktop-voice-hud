@@ -654,6 +654,7 @@ function LiveStrip() {
             size: 'sm',
             variant: 'ghost',
             className: 'h-6 shrink-0 rounded-full px-2.5 text-[0.68rem]',
+            'aria-label': 'End voice HUD session',
             onClick: () => endVoice(),
             children: 'End'
           })

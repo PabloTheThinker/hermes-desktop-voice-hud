@@ -35,9 +35,9 @@ const STYLE_ID = 'voice-hud-css'
 const END_MISS_TOLERANCE = 12
 const CORE_END_RE = /end voice conversation/i
 /** How long ephemeral words stay fully visible before fade. */
-const WORD_HOLD_MS = 1200
+const WORD_HOLD_MS = 4500
 /** Fade duration (CSS matches). */
-const WORD_FADE_MS = 800
+const WORD_FADE_MS = 1200
 /** Keep session overlay up while bus/core says active. */
 const SESSION_HOLD_MS = 2500
 
@@ -451,8 +451,8 @@ function ensureCss() {
 [data-voice-hud-live="1"] [data-slot="thread"],
 [data-voice-hud-live="1"] main [data-session-scroll],
 html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
-  opacity: 0.12 !important;
-  filter: blur(2px);
+  opacity: 0.2 !important;
+  filter: blur(1px);
   pointer-events: none !important;
   transition: opacity 0.45s ease, filter 0.45s ease;
 }
@@ -469,11 +469,13 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   padding: 1.25rem 1rem 6.5rem !important;
   border: none !important;
   border-radius: 0 !important;
+  /* Dark Live stage — Hermes night, soft blue orb glow (not blinding white) */
   background:
-    radial-gradient(circle at 50% 48%, rgba(147, 197, 253, 0.35) 0%, rgba(219, 234, 254, 0.55) 28%, rgba(248, 250, 252, 0.97) 58%, #f8fafc 100%) !important;
-  backdrop-filter: none !important;
+    radial-gradient(circle at 50% 46%, rgba(56, 120, 220, 0.18) 0%, rgba(15, 23, 42, 0.55) 42%, rgba(6, 8, 14, 0.94) 72%, #05070c 100%) !important;
+  backdrop-filter: blur(18px) saturate(1.05) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(1.05) !important;
   box-shadow: none !important;
-  color: #0f172a !important;
+  color: #e2e8f0 !important;
 }
 /* Concentric guide rings (static base; canvas draws active ripples) */
 [data-voice-hud="1"].vh-session::before {
@@ -486,11 +488,11 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   transform: translate(-50%, -50%);
   border-radius: 50%;
   background:
-    radial-gradient(circle, transparent 18%, rgba(147, 197, 253, 0.07) 18.5%, transparent 19%),
-    radial-gradient(circle, transparent 28%, rgba(147, 197, 253, 0.08) 28.5%, transparent 29.5%),
-    radial-gradient(circle, transparent 38%, rgba(147, 197, 253, 0.07) 38.5%, transparent 39.5%),
-    radial-gradient(circle, transparent 48%, rgba(147, 197, 253, 0.06) 48.5%, transparent 49.5%),
-    radial-gradient(circle, transparent 58%, rgba(147, 197, 253, 0.05) 58.5%, transparent 59.5%);
+    radial-gradient(circle, transparent 18%, rgba(96, 165, 250, 0.12) 18.5%, transparent 19%),
+    radial-gradient(circle, transparent 28%, rgba(96, 165, 250, 0.10) 28.5%, transparent 29.5%),
+    radial-gradient(circle, transparent 38%, rgba(96, 165, 250, 0.12) 38.5%, transparent 39.5%),
+    radial-gradient(circle, transparent 48%, rgba(96, 165, 250, 0.08) 48.5%, transparent 49.5%),
+    radial-gradient(circle, transparent 58%, rgba(96, 165, 250, 0.06) 58.5%, transparent 59.5%);
   pointer-events: none;
   z-index: 0;
 }
@@ -517,10 +519,10 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   justify-content: space-between;
   padding: 0.35rem 0.5rem 0.35rem 0.85rem;
   border-radius: 999px;
-  background: rgba(255,255,255,0.72);
-  border: 1px solid rgba(15, 23, 42, 0.06);
-  box-shadow: 0 8px 30px rgba(15, 23, 42, 0.06);
-  backdrop-filter: blur(12px);
+  background: rgba(8, 12, 22, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(14px);
 }
 [data-voice-hud="1"] .vh-live-pill {
   display: inline-flex;
@@ -529,7 +531,7 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   font-size: 0.92rem;
   font-weight: 600;
   letter-spacing: -0.01em;
-  color: #0f172a;
+  color: #f1f5f9;
 }
 [data-voice-hud="1"] .vh-live-dot {
   width: 0.45rem;
@@ -554,7 +556,7 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
 [data-voice-hud="1"] .vh-ghost {
   transition: opacity 0.4s ease, transform 0.45s ease;
   will-change: opacity, transform;
-  color: #334155;
+  color: #e2e8f0;
 }
 [data-voice-hud="1"] .vh-orb-shell {
   filter: drop-shadow(0 12px 40px rgba(96, 165, 250, 0.28));
@@ -566,13 +568,13 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   border-radius: 999px;
   padding: 0 0.9rem;
   background: transparent;
-  color: #334155;
+  color: #e2e8f0;
   font-size: 0.8rem;
   font-weight: 600;
   cursor: pointer;
 }
 [data-voice-hud="1"] .vh-end-btn:hover {
-  background: rgba(15, 23, 42, 0.06);
+  background: rgba(148, 163, 184, 0.12);
 }
 [data-voice-hud="1"] .vh-orb-wrap {
   display: flex;
@@ -641,7 +643,7 @@ function mountLivePortal() {
           <div class="vh-live-pill">
             <span class="vh-live-dot" data-on="listen" data-vh-dot></span>
             <span>Live</span>
-            <span class="vh-phase" data-vh-phase-label style="font-size:0.72rem;font-weight:400;color:#64748b"></span>
+            <span class="vh-phase" data-vh-phase-label style="font-size:0.72rem;font-weight:400;color:#94a3b8"></span>
           </div>
           <button type="button" class="vh-end-btn" data-voice-hud-end="1" aria-label="Stop voice HUD">End</button>
         </div>
@@ -662,7 +664,7 @@ function mountLivePortal() {
       'margin:0',
       'border:none',
       'pointer-events:auto',
-      'background:radial-gradient(circle at 50% 48%, rgba(147,197,253,0.35) 0%, rgba(219,234,254,0.55) 28%, rgba(248,250,252,0.97) 58%, #f8fafc 100%)'
+      'background:radial-gradient(circle at 50% 46%, rgba(56,120,220,0.2) 0%, rgba(15,23,42,0.62) 42%, rgba(6,8,14,0.95) 72%, #05070c 100%)'
     ].join(';')
     document.body.appendChild(root)
 
@@ -709,27 +711,44 @@ function paintLivePortalChrome() {
     const text = $ghostText.get()
     const op = $ghostOpacity.get()
     const role = $ghostRole.get()
-    if (text && op > 0.02) {
-      ghost.style.opacity = String(op)
-      ghost.style.transform = `translateY(${(1 - op) * 8}px)`
+    // Prefer live caption from bus if ghost empty (YOU words)
+    const caption = ($caption.get() || '').trim()
+    const showText = (text && op > 0.02) ? text : caption
+    const showRole = (text && op > 0.02) ? role : caption ? 'you' : ''
+    const showOp = (text && op > 0.02) ? op : caption ? 1 : 0
+
+    if (showText && showOp > 0.02) {
+      ghost.style.opacity = String(showOp)
+      ghost.style.transform = `translateY(${(1 - showOp) * 6}px)`
       ghost.setAttribute('aria-hidden', 'false')
+      const roleColor = showRole === 'agent' ? '#7dd3fc' : '#86efac'
+      const bodyColor = showRole === 'agent' ? '#e0f2fe' : '#f8fafc'
       ghost.innerHTML =
-        `<div style="text-align:center">` +
-        `<div style="margin-bottom:0.25rem;font-size:0.65rem;font-weight:600;letter-spacing:0.16em;text-transform:uppercase;color:#94a3b8">${
-          role === 'agent' ? 'ILO' : 'YOU'
+        `<div style="text-align:center;max-width:36rem;margin:0 auto;padding:0.5rem 1rem">` +
+        `<div style="margin-bottom:0.4rem;font-size:0.7rem;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;color:${roleColor}">${
+          showRole === 'agent' ? 'ILO' : 'YOU'
         }</div>` +
-        `<div style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;font-size:1.05rem;line-height:1.35;color:#334155">${escapeHtml(
-          text
+        `<div style="display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;font-size:1.2rem;font-weight:500;line-height:1.4;letter-spacing:-0.01em;color:${bodyColor};text-shadow:0 1px 18px rgba(0,0,0,0.55)">${escapeHtml(
+          showText
         )}</div></div>`
     } else {
-      ghost.style.opacity = '0'
-      ghost.setAttribute('aria-hidden', 'true')
+      ghost.style.opacity = listening ? '0.85' : '0.55'
+      ghost.setAttribute('aria-hidden', 'false')
       ghost.innerHTML = listening
-        ? ''
-        : `<div style="color:#94a3b8;font-size:0.85rem">${$busOk.get() ? '' : 'Starting Live…'}</div>`
+        ? `<div style="text-align:center;color:#94a3b8;font-size:0.95rem;font-weight:500">Listening — speak anytime</div>`
+        : `<div style="text-align:center;color:#64748b;font-size:0.9rem">${$busOk.get() ? phaseLabelSafe(phase) : 'Starting Live…'}</div>`
     }
   }
 }
+
+function phaseLabelSafe(p) {
+  if (p === 'listening' || p === 'recording') return 'Listening'
+  if (p === 'transcribing') return 'Got it'
+  if (p === 'thinking') return 'Thinking'
+  if (p === 'speaking') return 'Speaking'
+  return 'Live'
+}
+
 
 function escapeHtml(s) {
   return String(s)

@@ -592,22 +592,24 @@ function VoiceOrb({ size = 88 }) {
       let hueA = 200
       let hueB = 260
       if (ph === 'listening' || ph === 'recording') {
-        base = 0.38
-        speed = 0.9
+        // Always-alive listen motion so turn-2 feedback is obvious even
+        // before bus levels arrive.
+        base = 0.48
+        speed = 1.05
         hueA = 160
         hueB = 200
       } else if (ph === 'transcribing' || ph === 'thinking') {
-        base = 0.28
-        speed = 1.35
+        base = 0.32
+        speed = 1.45
         hueA = 45
         hueB = 200
       } else if (ph === 'speaking') {
-        base = 0.52
-        speed = 1.15
+        base = 0.58
+        speed = 1.2
         hueA = 210
         hueB = 280
       }
-      const amp = base + lv * 0.62
+      const amp = base + Math.max(lv, ph === 'listening' || ph === 'recording' ? 0.18 : 0) * 0.62
       const breathe = 1 + Math.sin(t * speed * 2.2) * 0.04 * (ph === 'speaking' ? 1.4 : 1)
 
       ctx.clearRect(0, 0, size, size)

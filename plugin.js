@@ -455,10 +455,10 @@ function ensureCss() {
 [data-voice-hud-live="1"] [data-slot="thread"],
 [data-voice-hud-live="1"] main [data-session-scroll],
 html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
-  opacity: 0.14 !important;
-  filter: blur(1px);
+  opacity: 0.22 !important;
+  filter: blur(0.5px);
   pointer-events: none !important;
-  transition: opacity 0.35s ease, filter 0.35s ease;
+  transition: opacity 0.4s ease, filter 0.4s ease;
 }
 [data-voice-hud="1"].vh-session {
   position: fixed !important;
@@ -469,15 +469,16 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   align-items: center !important;
   justify-content: center !important;
   margin: 0 !important;
-  padding: 2rem 1.25rem 6.5rem !important;
+  padding: 1.5rem 1rem 5.5rem !important;
   border: none !important;
   border-radius: 0 !important;
+  /* ChatGPT/Grok: deep void + single soft light behind orb */
   background:
-    radial-gradient(ellipse 70% 55% at 50% 42%, rgba(14, 165, 233, 0.14), transparent 70%),
-    radial-gradient(ellipse 90% 80% at 50% 100%, rgba(0,0,0,0.55), transparent 55%),
-    rgba(6, 10, 18, 0.78) !important;
-  backdrop-filter: blur(18px) saturate(1.15) !important;
-  -webkit-backdrop-filter: blur(18px) saturate(1.15) !important;
+    radial-gradient(ellipse 55% 48% at 50% 46%, rgba(56, 120, 220, 0.16), transparent 68%),
+    radial-gradient(ellipse 80% 70% at 50% 100%, rgba(0,0,0,0.65), transparent 50%),
+    rgba(4, 6, 12, 0.88) !important;
+  backdrop-filter: blur(22px) saturate(1.05) !important;
+  -webkit-backdrop-filter: blur(22px) saturate(1.05) !important;
   box-shadow: none !important;
 }
 [data-voice-hud="1"] .vh-ghost {
@@ -485,13 +486,16 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   will-change: opacity, transform;
 }
 [data-voice-hud="1"] .vh-orb-shell {
-  filter: drop-shadow(0 0 28px rgba(56, 189, 248, 0.28));
+  filter: drop-shadow(0 0 40px rgba(80, 140, 255, 0.25));
 }
 [data-voice-hud="1"][data-vh-phase="speaking"] .vh-orb-shell {
-  filter: drop-shadow(0 0 42px rgba(96, 165, 250, 0.55));
+  filter: drop-shadow(0 0 56px rgba(100, 150, 255, 0.45));
 }
 [data-voice-hud="1"][data-vh-phase="listening"] .vh-orb-shell {
-  filter: drop-shadow(0 0 32px rgba(52, 211, 153, 0.35));
+  filter: drop-shadow(0 0 48px rgba(60, 220, 180, 0.32));
+}
+[data-voice-hud="1"][data-vh-phase="thinking"] .vh-orb-shell {
+  filter: drop-shadow(0 0 44px rgba(240, 180, 70, 0.28));
 }
 /* Keep composer dock usable above the overlay for Stop/core End */
 [data-voice-hud-live="1"] [data-slot="composer-root"],
@@ -555,7 +559,7 @@ function wireGateway() {
 
 // --- Orb (primary UI — AI “speaks through” this) -----------------------------
 
-function VoiceOrb({ size = 88 }) {
+function VoiceOrb({ size = 160 }) {
   const ref = useRef(null)
   const level = useValue($level)
   const phase = useValue($phase)
@@ -572,95 +576,129 @@ function VoiceOrb({ size = 88 }) {
     let raf = 0
     const t0 = performance.now()
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
-    c.width = Math.round(size * dpr)
-    c.height = Math.round(size * dpr)
-    c.style.width = size + 'px'
-    c.style.height = size + 'px'
+    const pad = Math.round(size * 0.22)
+    const W = size + pad * 2
+    c.width = Math.round(W * dpr)
+    c.height = Math.round(W * dpr)
+    c.style.width = W + 'px'
+    c.style.height = W + 'px'
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    const FIBERS = 42
 
+    /**
+     * Grok / ChatGPT-style soft voice orb:
+     * one luminous sphere + soft halo, phase color, mic-driven breathe.
+     * No fiber/torus clutter.
+     */
     const draw = now => {
       const t = (now - t0) / 1000
-      const cx = size / 2
-      const cy = size / 2
+      const cx = W / 2
+      const cy = W / 2
       const ph = pr.current
-      const lv = lr.current
+      const lv = Math.max(0, Math.min(1, lr.current))
 
-      // Phase personality (ChatGPT/Grok-like state motion)
-      let base = 0.22
-      let speed = 0.55
-      let hueA = 200
-      let hueB = 260
+      // Soft palette (Grok-colored orb / ChatGPT liquid sphere)
+      let c0 = [120, 200, 255] // core
+      let c1 = [56, 120, 220] // mid
+      let c2 = [20, 40, 90] // rim
+      let pulse = 0.035
+      let energy = 0.22
       if (ph === 'listening' || ph === 'recording') {
-        // Always-alive listen motion so turn-2 feedback is obvious even
-        // before bus levels arrive.
-        base = 0.48
-        speed = 1.05
-        hueA = 160
-        hueB = 200
+        c0 = [160, 255, 220]
+        c1 = [40, 200, 160]
+        c2 = [10, 60, 55]
+        pulse = 0.05
+        energy = 0.38 + lv * 0.45
       } else if (ph === 'transcribing' || ph === 'thinking') {
-        base = 0.32
-        speed = 1.45
-        hueA = 45
-        hueB = 200
+        c0 = [255, 230, 170]
+        c1 = [220, 160, 60]
+        c2 = [70, 45, 15]
+        pulse = 0.06
+        energy = 0.3
       } else if (ph === 'speaking') {
-        base = 0.58
-        speed = 1.2
-        hueA = 210
-        hueB = 280
+        c0 = [200, 220, 255]
+        c1 = [90, 140, 255]
+        c2 = [30, 40, 120]
+        pulse = 0.07
+        energy = 0.5 + lv * 0.4
       }
-      const amp = base + Math.max(lv, ph === 'listening' || ph === 'recording' ? 0.18 : 0) * 0.62
-      const breathe = 1 + Math.sin(t * speed * 2.2) * 0.04 * (ph === 'speaking' ? 1.4 : 1)
 
-      ctx.clearRect(0, 0, size, size)
+      const breathe = 1 + Math.sin(t * (ph === 'thinking' ? 3.2 : 2.1)) * pulse * (1 + energy)
+      const R = (size * 0.34) * breathe * (1 + energy * 0.08)
 
-      // Soft outer glow
-      const glowR = size * 0.48 * breathe
-      const glow = ctx.createRadialGradient(cx, cy, size * 0.08, cx, cy, glowR)
-      glow.addColorStop(0, `hsla(${hueA},95%,62%,${0.55 + amp * 0.35})`)
-      glow.addColorStop(0.45, `hsla(${(hueA + hueB) / 2},90%,50%,${0.22 + amp * 0.2})`)
-      glow.addColorStop(1, `hsla(${hueB},80%,40%,0)`)
-      ctx.fillStyle = glow
+      ctx.clearRect(0, 0, W, W)
+
+      // Far halo (atmosphere)
+      const halo = ctx.createRadialGradient(cx, cy, R * 0.2, cx, cy, R * 2.1)
+      halo.addColorStop(0, `rgba(${c1[0]},${c1[1]},${c1[2]},${0.22 + energy * 0.2})`)
+      halo.addColorStop(0.45, `rgba(${c1[0]},${c1[1]},${c1[2]},${0.08 + energy * 0.08})`)
+      halo.addColorStop(1, 'rgba(0,0,0,0)')
+      ctx.fillStyle = halo
       ctx.beginPath()
-      ctx.arc(cx, cy, glowR, 0, Math.PI * 2)
+      ctx.arc(cx, cy, R * 2.1, 0, Math.PI * 2)
       ctx.fill()
 
-      // Core sphere
-      const coreR = size * (0.22 + amp * 0.06) * breathe
-      const core = ctx.createRadialGradient(cx - coreR * 0.25, cy - coreR * 0.3, 1, cx, cy, coreR)
-      core.addColorStop(0, `hsla(${hueA},100%,88%,${0.95})`)
-      core.addColorStop(0.45, `hsla(${hueA},90%,58%,${0.75})`)
-      core.addColorStop(1, `hsla(${hueB},85%,35%,${0.35})`)
-      ctx.fillStyle = core
-      ctx.beginPath()
-      ctx.arc(cx, cy, coreR, 0, Math.PI * 2)
-      ctx.fill()
-
-      // Torus fibers (Iron Man / advanced voice texture)
-      for (let i = 0; i < FIBERS; i++) {
-        const hue = hueA + (i / FIBERS) * (hueB - hueA) + t * 40
-        const a0 = (i / FIBERS) * Math.PI * 2 + t * speed * 0.7
+      // Soft ring pulse (speaking/listening)
+      if (ph === 'speaking' || ph === 'listening' || ph === 'recording') {
+        const ring = 0.55 + 0.45 * Math.sin(t * 2.4 + energy)
         ctx.beginPath()
-        for (let s = 0; s <= 14; s++) {
-          const u = s / 14
-          const r =
-            size * (0.14 + u * 0.28) * breathe +
-            Math.sin(t * 3.2 * speed + i * 0.4 + u * 6) * size * 0.04 * amp
-          const a = a0 + u * 1.7 + Math.sin(t + i) * 0.08 * amp
-          const x = cx + Math.cos(a) * r
-          const y = cy + Math.sin(a) * r * (0.92 + amp * 0.08)
-          if (s === 0) ctx.moveTo(x, y)
-          else ctx.lineTo(x, y)
-        }
-        ctx.strokeStyle = `hsla(${hue % 360},92%,62%,${0.14 + amp * 0.42})`
-        ctx.lineWidth = 0.85 + amp * 0.5
+        ctx.arc(cx, cy, R * (1.35 + ring * 0.12 * energy), 0, Math.PI * 2)
+        ctx.strokeStyle = `rgba(${c0[0]},${c0[1]},${c0[2]},${0.12 + energy * 0.18})`
+        ctx.lineWidth = 2 + energy * 2
         ctx.stroke()
       }
 
-      // Specular highlight
-      ctx.fillStyle = `hsla(0,0%,100%,${0.18 + amp * 0.12})`
+      // Main sphere body
+      const body = ctx.createRadialGradient(
+        cx - R * 0.28,
+        cy - R * 0.32,
+        R * 0.05,
+        cx,
+        cy + R * 0.1,
+        R
+      )
+      body.addColorStop(0, `rgba(${c0[0]},${c0[1]},${c0[2]},0.98)`)
+      body.addColorStop(0.35, `rgba(${c1[0]},${c1[1]},${c1[2]},0.92)`)
+      body.addColorStop(0.78, `rgba(${c2[0]},${c2[1]},${c2[2]},0.88)`)
+      body.addColorStop(1, `rgba(${c2[0]},${c2[1]},${c2[2]},0.2)`)
+      ctx.fillStyle = body
       ctx.beginPath()
-      ctx.ellipse(cx - coreR * 0.28, cy - coreR * 0.32, coreR * 0.22, coreR * 0.14, -0.5, 0, Math.PI * 2)
+      ctx.arc(cx, cy, R, 0, Math.PI * 2)
+      ctx.fill()
+
+      // Inner liquid shimmer (very subtle — not fibers)
+      ctx.save()
+      ctx.beginPath()
+      ctx.arc(cx, cy, R * 0.92, 0, Math.PI * 2)
+      ctx.clip()
+      for (let i = 0; i < 5; i++) {
+        const a = t * (0.6 + i * 0.15) + i
+        const ox = Math.cos(a) * R * 0.25
+        const oy = Math.sin(a * 1.3) * R * 0.2
+        const g = ctx.createRadialGradient(cx + ox, cy + oy, 0, cx + ox, cy + oy, R * 0.55)
+        g.addColorStop(0, `rgba(255,255,255,${0.07 + energy * 0.06})`)
+        g.addColorStop(1, 'rgba(255,255,255,0)')
+        ctx.fillStyle = g
+        ctx.beginPath()
+        ctx.arc(cx + ox, cy + oy, R * 0.55, 0, Math.PI * 2)
+        ctx.fill()
+      }
+      ctx.restore()
+
+      // Specular highlight
+      const hi = ctx.createRadialGradient(
+        cx - R * 0.3,
+        cy - R * 0.35,
+        0,
+        cx - R * 0.3,
+        cy - R * 0.35,
+        R * 0.45
+      )
+      hi.addColorStop(0, 'rgba(255,255,255,0.55)')
+      hi.addColorStop(0.35, 'rgba(255,255,255,0.12)')
+      hi.addColorStop(1, 'rgba(255,255,255,0)')
+      ctx.fillStyle = hi
+      ctx.beginPath()
+      ctx.ellipse(cx - R * 0.22, cy - R * 0.28, R * 0.32, R * 0.2, -0.5, 0, Math.PI * 2)
       ctx.fill()
 
       raf = requestAnimationFrame(draw)
@@ -707,28 +745,24 @@ function LiveStrip() {
 
   const listening = phase === 'listening' || phase === 'recording'
   const speaking = phase === 'speaking'
-  // Full-session orb — larger when AI speaks (ChatGPT/Grok pattern)
-  const orbSize = speaking ? 168 : listening ? 148 : 128
-
+  // Large soft orb — Grok/ChatGPT scale, full conversation cover
+  const orbSize = speaking ? 200 : listening ? 184 : 168
   const showGhost = Boolean(ghostText) && ghostOpacity > 0.02
 
   return jsxs('div', {
-    className: cn(
-      'vh-session flex flex-col items-center gap-4',
-      'text-muted-foreground'
-    ),
+    className: 'vh-session flex flex-col items-center justify-center gap-6 text-white/80',
     role: 'status',
     'aria-live': 'polite',
     'data-voice-hud': '1',
     'data-vh-phase': phase,
     children: [
-      // Top chrome: minimal floating bar
+      // Minimal floating controls (ChatGPT Voice: mute/end style bar)
       jsxs('div', {
         className:
-          'absolute top-4 left-1/2 z-[1] flex w-[min(28rem,calc(100%-2rem))] -translate-x-1/2 items-center justify-between gap-2 rounded-full border border-white/10 bg-black/35 px-3 py-1.5 backdrop-blur-md',
+          'absolute top-5 left-1/2 z-[2] flex -translate-x-1/2 items-center gap-3 rounded-full border border-white/10 bg-black/40 px-4 py-2 backdrop-blur-xl',
         children: [
           jsxs('div', {
-            className: 'flex items-center gap-1.5 text-[0.7rem] text-white/70',
+            className: 'flex items-center gap-2 text-[0.72rem] text-white/65',
             children: [
               jsx('span', {
                 className: cn(
@@ -737,7 +771,7 @@ function LiveStrip() {
                     ? 'animate-pulse bg-emerald-400'
                     : speaking
                       ? 'animate-pulse bg-sky-400'
-                      : 'bg-amber-400/90'
+                      : 'bg-amber-300/90'
                 )
               }),
               jsx('span', {
@@ -745,20 +779,18 @@ function LiveStrip() {
                 children: phaseLabel(phase)
               }),
               jsx('span', {
-                className: 'font-mono tabular-nums opacity-60',
+                className: 'font-mono tabular-nums text-white/40',
                 children: formatElapsed(elapsed / 1000)
-              }),
-              jsx('span', {
-                className: 'hidden text-[0.62rem] text-white/40 sm:inline',
-                children: busOk ? 'session' : 'arming…'
               })
             ]
           }),
+          jsx('span', { className: 'h-3 w-px bg-white/15', 'aria-hidden': true }),
           jsx(Button, {
             type: 'button',
             size: 'sm',
             variant: 'ghost',
-            className: 'h-7 shrink-0 rounded-full px-3 text-[0.72rem] text-white/85 hover:bg-white/10',
+            className:
+              'h-7 rounded-full px-3.5 text-[0.72rem] text-white/90 hover:bg-white/10 hover:text-white',
             'aria-label': 'Stop voice HUD',
             'data-voice-hud-end': '1',
             onClick: e => {
@@ -766,27 +798,26 @@ function LiveStrip() {
               e.stopPropagation()
               endVoice()
             },
-            children: 'Stop'
+            children: 'End'
           })
         ]
       }),
 
-      // THE ORB — fills the session stage
+      // Soft orb center stage
       jsx('div', {
         className: cn(
-          'flex flex-1 items-center justify-center transition-transform duration-500',
-          speaking ? 'scale-105' : 'scale-100'
+          'flex flex-1 items-center justify-center pt-10 transition-transform duration-500 ease-out',
+          speaking ? 'scale-[1.04]' : 'scale-100'
         ),
         children: jsx(VoiceOrb, { size: orbSize })
       }),
 
-      // Ephemeral words — appear then disappear
+      // Ephemeral caption — words appear then dissolve (not a transcript panel)
       jsx('div', {
-        className:
-          'vh-ghost flex min-h-[3.5rem] w-full max-w-xl flex-col items-center justify-center px-4 pb-2',
+        className: 'vh-ghost flex min-h-[4rem] w-full max-w-lg flex-col items-center px-6 pb-8',
         style: {
           opacity: showGhost ? ghostOpacity : 0,
-          transform: showGhost ? `translateY(${(1 - ghostOpacity) * 8}px)` : 'translateY(6px)'
+          transform: showGhost ? `translateY(${(1 - ghostOpacity) * 10}px)` : 'translateY(8px)'
         },
         'aria-hidden': !showGhost,
         children: showGhost
@@ -794,27 +825,26 @@ function LiveStrip() {
               className: 'text-center',
               children: [
                 jsx('div', {
-                  className:
-                    'mb-1 text-[0.58rem] font-medium uppercase tracking-[0.18em] text-white/40',
+                  className: 'mb-1.5 text-[0.6rem] font-medium uppercase tracking-[0.2em] text-white/35',
                   children: ghostRole === 'agent' ? 'ILO' : 'YOU'
                 }),
                 jsx('div', {
                   className: cn(
-                    'line-clamp-3 text-[1.05rem] leading-snug',
-                    ghostRole === 'agent' ? 'text-sky-100/90' : 'text-white/90'
+                    'line-clamp-3 text-[1.1rem] font-normal leading-relaxed tracking-tight',
+                    ghostRole === 'agent' ? 'text-sky-50/90' : 'text-white/88'
                   ),
                   children: ghostText
                 })
               ]
             })
           : jsx('div', {
-              className: 'text-center text-[0.78rem] text-white/35',
+              className: 'text-center text-[0.8rem] tracking-wide text-white/30',
               children: !busOk
-                ? 'Full session · waiting for Desktop voice bus'
+                ? 'Connecting voice…'
                 : speaking
                   ? ''
                   : listening
-                    ? 'Speak anytime — continuous session'
+                    ? 'Listening'
                     : phaseLabel(phase)
             })
       })

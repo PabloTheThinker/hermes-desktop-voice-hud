@@ -1,19 +1,26 @@
-# Orb-first voice UX research (2026-08)
-
-## Products studied
-- **ChatGPT Advanced Voice**: classic full-screen reactive orb (listen / think / speak). Later moved into the chat window with visible transcripts — users wanted words *and* continuity; classic orb still prioritizes **motion as the voice**.
-- **Grok Voice**: speech-forward experience; voice orbs/colors per voice character; speech-to-speech feel where the UI is the speaking agent, not a log.
-- **AI UX pattern “Voice visualizer”**: real-time waveform/orb motion across listen → think → speak states.
-
-## Design principles applied to Voice HUD
-1. **Orb is primary** — AI “speaks through” the orb (size/energy up on speaking).
-2. **Words are ephemeral** — captions appear briefly then fade (hold ~1.4s, fade ~0.9s); no chat replay.
-3. **Phase personality** — listening (teal/calm), thinking (amber pulse), speaking (blue/violet energy).
-4. **Native stack only** — still `hermes:voice-bus` + Desktop Whisper; no second mic.
-5. **Stop stays Stop** — no End self-click loop.
+# Voice orb UX research → redesign (2026-08-06)
 
 ## Sources
-- PCMag: ChatGPT voice into chat / orb history
-- AI UX Playground: Voice visualizer pattern
-- FuseLab VUI 2026 guide
-- xAI / Grok Voice Think Fast 2.0 + voice product notes
+- X: @tonbistudio Hermes Desktop browser post (context); Grok iOS voice **colored orbs** (@testingcatalog / @n5waha)
+- grok.com — voice mode on desktop (signed-in surface); soft sphere aesthetic on product/console
+- ChatGPT Voice (GPT-Live): voice in Chat / Work / **Codex** desktop app — conversation stays covered, controls = mic mute / speaker mute / end
+- OpenAI learn docs: ChatGPT Voice coordinates tasks without leaving the app mode
+
+## Product patterns locked
+| Pattern | Grok | ChatGPT / Codex voice |
+|---------|------|------------------------|
+| Visual | Soft **colored orb** per voice | Soft liquid sphere / in-chat voice stage |
+| Space | Full voice stage | Covers conversation mode (not a side chrome strip) |
+| Words | Secondary | Transcript optional; voice is primary |
+| Controls | Minimal | Mute mic, mute speakers, End |
+
+## What we rejected
+- Dense Iron Man fiber/torus orb (previous HUD) — too busy, not Grok/ChatGPT
+- Dock-only strip — does not “cover the conversation”
+
+## What we shipped
+- Full-session dark glass stage over the chat
+- **One soft luminous sphere** + halo + subtle liquid shimmer (no fiber mesh)
+- Phase colors: listen teal, think amber, speak blue/violet
+- Ephemeral ghost words that fade
+- Top pill: phase · timer · End (Stop stays HUD-safe)

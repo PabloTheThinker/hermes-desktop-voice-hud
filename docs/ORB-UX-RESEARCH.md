@@ -1,26 +1,23 @@
-# Voice orb UX research → redesign (2026-08-06)
+# ChatGPT Live voice UX → Hermes Voice HUD (2026-08-06)
 
-## Sources
-- X: @tonbistudio Hermes Desktop browser post (context); Grok iOS voice **colored orbs** (@testingcatalog / @n5waha)
-- grok.com — voice mode on desktop (signed-in surface); soft sphere aesthetic on product/console
-- ChatGPT Voice (GPT-Live): voice in Chat / Work / **Codex** desktop app — conversation stays covered, controls = mic mute / speaker mute / end
-- OpenAI learn docs: ChatGPT Voice coordinates tasks without leaving the app mode
+## Reference
+OpenAI product shot (Live / GPT-Live): three Android panels —
+1. Chat + small bottom orb while Live runs in-thread  
+2. **Full Live stage**: white canvas, soft blue–white sphere, concentric ripple rings, top “Live”, bottom Ask bar + End  
+3. Voice settings (Maple, Live/Advanced/Standard) — settings surface, not the stage  
 
-## Product patterns locked
-| Pattern | Grok | ChatGPT / Codex voice |
-|---------|------|------------------------|
-| Visual | Soft **colored orb** per voice | Soft liquid sphere / in-chat voice stage |
-| Space | Full voice stage | Covers conversation mode (not a side chrome strip) |
-| Words | Secondary | Transcript optional; voice is primary |
-| Controls | Minimal | Mute mic, mute speakers, End |
+X: OpenAI GPT-Live announcements; ChatGPT Voice docs (Chat / Work / Codex).
 
-## What we rejected
-- Dense Iron Man fiber/torus orb (previous HUD) — too busy, not Grok/ChatGPT
-- Dock-only strip — does not “cover the conversation”
+## Locked visual system
+| Element | Spec |
+|---------|------|
+| Stage | Light `#f8fafc` wash, soft blue radial glow |
+| Orb | White core → periwinkle rim, soft bloom |
+| Motion | Expanding concentric rings + gentle breathe |
+| Phase | Listen green dot · Think amber · Speak blue pulse |
+| Words | Ephemeral ghost under orb (fade), not a log |
+| Chrome | Top pill “Live” + End only |
+| Cover | Full session over chat (thread dimmed) |
 
-## What we shipped
-- Full-session dark glass stage over the chat
-- **One soft luminous sphere** + halo + subtle liquid shimmer (no fiber mesh)
-- Phase colors: listen teal, think amber, speak blue/violet
-- Ephemeral ghost words that fade
-- Top pill: phase · timer · End (Stop stays HUD-safe)
+## Native contract (unchanged)
+`hermes:voice-bus` + Desktop Whisper. No second mic / Web Speech.

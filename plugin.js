@@ -1,18 +1,14 @@
 /**
- * voice-hud — Grok/ChatGPT-style orb-first skin over Desktop native voice.
+ * voice-hud — ChatGPT Live–style voice stage over Hermes Desktop native voice.
  *
- * Research (2026): ChatGPT Advanced Voice used a full-screen reactive orb
- * (listen/think/speak). Later ChatGPT folded voice into chat with transcripts;
- * classic orb UX still prioritizes motion over persistent text. Grok voice
- * uses colored orbs / speech-forward visuals. AI UX pattern: voice visualizer
- * = phase-reactive motion; words are ephemeral.
+ * Target UX (OpenAI Live / GPT-Live product shots):
+ *  • Clean light full-session stage over the conversation
+ *  • Soft blue–white luminous sphere (not fiber/torus clutter)
+ *  • Concentric ripple rings reacting to mic level / phase
+ *  • Minimal top "Live" chrome + End
+ *  • Ephemeral words only — no chat replay panel
  *
- * This skin:
- *  • Large center orb is the “speaker” — energy follows bus level + phase
- *  • Captions appear briefly then fade (words disappear)
- *  • No chat-history replay; native hermes:voice-bus only (no second mic)
- *  • Stop never self-clicks core End
- *
+ * Native stack only: hermes:voice-bus (Desktop Whisper). No second mic.
  * Opt-in: defaultEnabled false. Imports: @hermes/plugin-sdk + react* only.
  */
 import {
@@ -446,20 +442,21 @@ function ensureCss() {
     document.head.appendChild(el)
   }
   el.textContent = `
-/* Hide stock voice strip while orb session owns the surface */
+/* Hide stock voice strip while Live owns the surface */
 [data-voice-hud-live="1"] [data-slot="composer-fade"] > [aria-live="polite"][role="status"].h-8:not([data-voice-hud]) {
   display: none !important;
 }
-/* Soften message list so the session feels like Advanced Voice, not a log */
+/* Soften thread behind Live stage (ChatGPT keeps context faintly) */
 [data-voice-hud-live="1"] [data-slot="messages"],
 [data-voice-hud-live="1"] [data-slot="thread"],
 [data-voice-hud-live="1"] main [data-session-scroll],
 html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
-  opacity: 0.22 !important;
-  filter: blur(0.5px);
+  opacity: 0.12 !important;
+  filter: blur(2px);
   pointer-events: none !important;
-  transition: opacity 0.4s ease, filter 0.4s ease;
+  transition: opacity 0.45s ease, filter 0.45s ease;
 }
+/* Full-session Live stage — light canvas like ChatGPT Live */
 [data-voice-hud="1"].vh-session {
   position: fixed !important;
   inset: 0 !important;
@@ -469,35 +466,99 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
   align-items: center !important;
   justify-content: center !important;
   margin: 0 !important;
-  padding: 1.5rem 1rem 5.5rem !important;
+  padding: 1.25rem 1rem 6.5rem !important;
   border: none !important;
   border-radius: 0 !important;
-  /* ChatGPT/Grok: deep void + single soft light behind orb */
   background:
-    radial-gradient(ellipse 55% 48% at 50% 46%, rgba(56, 120, 220, 0.16), transparent 68%),
-    radial-gradient(ellipse 80% 70% at 50% 100%, rgba(0,0,0,0.65), transparent 50%),
-    rgba(4, 6, 12, 0.88) !important;
-  backdrop-filter: blur(22px) saturate(1.05) !important;
-  -webkit-backdrop-filter: blur(22px) saturate(1.05) !important;
+    radial-gradient(circle at 50% 48%, rgba(147, 197, 253, 0.35) 0%, rgba(219, 234, 254, 0.55) 28%, rgba(248, 250, 252, 0.97) 58%, #f8fafc 100%) !important;
+  backdrop-filter: none !important;
   box-shadow: none !important;
+  color: #0f172a !important;
+}
+/* Concentric guide rings (static base; canvas draws active ripples) */
+[data-voice-hud="1"].vh-session::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  width: min(92vmin, 720px);
+  height: min(92vmin, 720px);
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 18%, rgba(147, 197, 253, 0.07) 18.5%, transparent 19%),
+    radial-gradient(circle, transparent 28%, rgba(147, 197, 253, 0.08) 28.5%, transparent 29.5%),
+    radial-gradient(circle, transparent 38%, rgba(147, 197, 253, 0.07) 38.5%, transparent 39.5%),
+    radial-gradient(circle, transparent 48%, rgba(147, 197, 253, 0.06) 48.5%, transparent 49.5%),
+    radial-gradient(circle, transparent 58%, rgba(147, 197, 253, 0.05) 58.5%, transparent 59.5%);
+  pointer-events: none;
+  z-index: 0;
+}
+[data-voice-hud="1"] .vh-stage {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+[data-voice-hud="1"] .vh-topbar {
+  position: absolute;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: min(20rem, calc(100% - 2rem));
+  justify-content: space-between;
+  padding: 0.35rem 0.5rem 0.35rem 0.85rem;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.72);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  box-shadow: 0 8px 30px rgba(15, 23, 42, 0.06);
+  backdrop-filter: blur(12px);
+}
+[data-voice-hud="1"] .vh-live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.92rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: #0f172a;
+}
+[data-voice-hud="1"] .vh-live-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.15);
+}
+[data-voice-hud="1"] .vh-live-dot[data-on="speak"] {
+  background: #3b82f6;
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.18);
+  animation: vh-pulse 1.2s ease-in-out infinite;
+}
+[data-voice-hud="1"] .vh-live-dot[data-on="think"] {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+}
+@keyframes vh-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.15); opacity: 0.75; }
 }
 [data-voice-hud="1"] .vh-ghost {
-  transition: opacity 0.35s ease, transform 0.45s ease;
+  transition: opacity 0.4s ease, transform 0.45s ease;
   will-change: opacity, transform;
+  color: #334155;
 }
 [data-voice-hud="1"] .vh-orb-shell {
-  filter: drop-shadow(0 0 40px rgba(80, 140, 255, 0.25));
+  filter: drop-shadow(0 12px 40px rgba(96, 165, 250, 0.28));
 }
-[data-voice-hud="1"][data-vh-phase="speaking"] .vh-orb-shell {
-  filter: drop-shadow(0 0 56px rgba(100, 150, 255, 0.45));
-}
-[data-voice-hud="1"][data-vh-phase="listening"] .vh-orb-shell {
-  filter: drop-shadow(0 0 48px rgba(60, 220, 180, 0.32));
-}
-[data-voice-hud="1"][data-vh-phase="thinking"] .vh-orb-shell {
-  filter: drop-shadow(0 0 44px rgba(240, 180, 70, 0.28));
-}
-/* Keep composer dock usable above the overlay for Stop/core End */
 [data-voice-hud-live="1"] [data-slot="composer-root"],
 [data-voice-hud-live="1"] [data-slot="composer-dock"] {
   position: relative;
@@ -506,7 +567,7 @@ html[data-voice-hud-live="1"] [data-slot="chat-scroll"] {
 `
 }
 
-function setLiveAttr(on) {
+function setLiveAttrfunction setLiveAttr(on) {
   if (typeof document === 'undefined') return
   document.querySelectorAll('[data-slot="composer-root"], [data-slot="composer-dock"]').forEach(n => {
     if (on) n.setAttribute('data-voice-hud-live', '1')
@@ -559,7 +620,7 @@ function wireGateway() {
 
 // --- Orb (primary UI — AI “speaks through” this) -----------------------------
 
-function VoiceOrb({ size = 160 }) {
+function VoiceOrb({ size = 180 }) {
   const ref = useRef(null)
   const level = useValue($level)
   const phase = useValue($phase)
@@ -576,7 +637,8 @@ function VoiceOrb({ size = 160 }) {
     let raf = 0
     const t0 = performance.now()
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1))
-    const pad = Math.round(size * 0.22)
+    // Extra room for expanding ripples (ChatGPT Live rings)
+    const pad = Math.round(size * 0.85)
     const W = size + pad * 2
     c.width = Math.round(W * dpr)
     c.height = Math.round(W * dpr)
@@ -585,9 +647,8 @@ function VoiceOrb({ size = 160 }) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
     /**
-     * Grok / ChatGPT-style soft voice orb:
-     * one luminous sphere + soft halo, phase color, mic-driven breathe.
-     * No fiber/torus clutter.
+     * ChatGPT Live orb: soft blue–white sphere + concentric ripples.
+     * Reference: OpenAI Live product UI (center phone in marketing shot).
      */
     const draw = now => {
       const t = (now - t0) / 1000
@@ -596,109 +657,88 @@ function VoiceOrb({ size = 160 }) {
       const ph = pr.current
       const lv = Math.max(0, Math.min(1, lr.current))
 
-      // Soft palette (Grok-colored orb / ChatGPT liquid sphere)
-      let c0 = [120, 200, 255] // core
-      let c1 = [56, 120, 220] // mid
-      let c2 = [20, 40, 90] // rim
-      let pulse = 0.035
-      let energy = 0.22
+      let energy = 0.2
+      let speed = 1.0
+      // Soft blue family (screenshot): periwinkle → white
       if (ph === 'listening' || ph === 'recording') {
-        c0 = [160, 255, 220]
-        c1 = [40, 200, 160]
-        c2 = [10, 60, 55]
-        pulse = 0.05
-        energy = 0.38 + lv * 0.45
+        energy = 0.35 + lv * 0.55
+        speed = 1.15
       } else if (ph === 'transcribing' || ph === 'thinking') {
-        c0 = [255, 230, 170]
-        c1 = [220, 160, 60]
-        c2 = [70, 45, 15]
-        pulse = 0.06
-        energy = 0.3
+        energy = 0.28
+        speed = 1.5
       } else if (ph === 'speaking') {
-        c0 = [200, 220, 255]
-        c1 = [90, 140, 255]
-        c2 = [30, 40, 120]
-        pulse = 0.07
-        energy = 0.5 + lv * 0.4
+        energy = 0.55 + lv * 0.4
+        speed = 1.25
       }
 
-      const breathe = 1 + Math.sin(t * (ph === 'thinking' ? 3.2 : 2.1)) * pulse * (1 + energy)
-      const R = (size * 0.34) * breathe * (1 + energy * 0.08)
+      const breathe = 1 + Math.sin(t * 2.0 * speed) * (0.03 + energy * 0.025)
+      const R = size * 0.5 * breathe
 
       ctx.clearRect(0, 0, W, W)
 
-      // Far halo (atmosphere)
-      const halo = ctx.createRadialGradient(cx, cy, R * 0.2, cx, cy, R * 2.1)
-      halo.addColorStop(0, `rgba(${c1[0]},${c1[1]},${c1[2]},${0.22 + energy * 0.2})`)
-      halo.addColorStop(0.45, `rgba(${c1[0]},${c1[1]},${c1[2]},${0.08 + energy * 0.08})`)
-      halo.addColorStop(1, 'rgba(0,0,0,0)')
-      ctx.fillStyle = halo
-      ctx.beginPath()
-      ctx.arc(cx, cy, R * 2.1, 0, Math.PI * 2)
-      ctx.fill()
-
-      // Soft ring pulse (speaking/listening)
-      if (ph === 'speaking' || ph === 'listening' || ph === 'recording') {
-        const ring = 0.55 + 0.45 * Math.sin(t * 2.4 + energy)
+      // Concentric ripples (ChatGPT Live signature)
+      const ringCount = 5
+      for (let i = 0; i < ringCount; i++) {
+        const phaseOff = (t * speed * 0.35 + i / ringCount) % 1
+        const rr = R * (1.15 + phaseOff * (1.9 + energy * 0.6))
+        const alpha = (1 - phaseOff) * (0.1 + energy * 0.16)
         ctx.beginPath()
-        ctx.arc(cx, cy, R * (1.35 + ring * 0.12 * energy), 0, Math.PI * 2)
-        ctx.strokeStyle = `rgba(${c0[0]},${c0[1]},${c0[2]},${0.12 + energy * 0.18})`
-        ctx.lineWidth = 2 + energy * 2
+        ctx.arc(cx, cy, rr, 0, Math.PI * 2)
+        ctx.strokeStyle = `rgba(147, 197, 253, ${alpha})`
+        ctx.lineWidth = 1.25 + (1 - phaseOff) * 1.5
         ctx.stroke()
       }
 
-      // Main sphere body
+      // Soft outer bloom
+      const bloom = ctx.createRadialGradient(cx, cy, R * 0.3, cx, cy, R * 1.55)
+      bloom.addColorStop(0, `rgba(191, 219, 254, ${0.35 + energy * 0.25})`)
+      bloom.addColorStop(0.55, `rgba(191, 219, 254, ${0.12 + energy * 0.1})`)
+      bloom.addColorStop(1, 'rgba(191, 219, 254, 0)')
+      ctx.fillStyle = bloom
+      ctx.beginPath()
+      ctx.arc(cx, cy, R * 1.55, 0, Math.PI * 2)
+      ctx.fill()
+
+      // Main soft sphere — white core → soft blue edge (exact Live look)
       const body = ctx.createRadialGradient(
-        cx - R * 0.28,
-        cy - R * 0.32,
+        cx - R * 0.2,
+        cy - R * 0.25,
         R * 0.05,
-        cx,
+        cx + R * 0.05,
         cy + R * 0.1,
         R
       )
-      body.addColorStop(0, `rgba(${c0[0]},${c0[1]},${c0[2]},0.98)`)
-      body.addColorStop(0.35, `rgba(${c1[0]},${c1[1]},${c1[2]},0.92)`)
-      body.addColorStop(0.78, `rgba(${c2[0]},${c2[1]},${c2[2]},0.88)`)
-      body.addColorStop(1, `rgba(${c2[0]},${c2[1]},${c2[2]},0.2)`)
+      body.addColorStop(0, 'rgba(255, 255, 255, 1)')
+      body.addColorStop(0.28, 'rgba(239, 246, 255, 0.98)')
+      body.addColorStop(0.55, `rgba(191, 219, 254, ${0.95})`)
+      body.addColorStop(0.82, `rgba(147, 197, 253, ${0.9 + energy * 0.05})`)
+      body.addColorStop(1, `rgba(96, 165, 250, ${0.55 + energy * 0.15})`)
       ctx.fillStyle = body
       ctx.beginPath()
       ctx.arc(cx, cy, R, 0, Math.PI * 2)
       ctx.fill()
 
-      // Inner liquid shimmer (very subtle — not fibers)
+      // Inner soft caustic (very subtle motion)
       ctx.save()
       ctx.beginPath()
-      ctx.arc(cx, cy, R * 0.92, 0, Math.PI * 2)
+      ctx.arc(cx, cy, R * 0.95, 0, Math.PI * 2)
       ctx.clip()
-      for (let i = 0; i < 5; i++) {
-        const a = t * (0.6 + i * 0.15) + i
-        const ox = Math.cos(a) * R * 0.25
-        const oy = Math.sin(a * 1.3) * R * 0.2
-        const g = ctx.createRadialGradient(cx + ox, cy + oy, 0, cx + ox, cy + oy, R * 0.55)
-        g.addColorStop(0, `rgba(255,255,255,${0.07 + energy * 0.06})`)
-        g.addColorStop(1, 'rgba(255,255,255,0)')
-        ctx.fillStyle = g
-        ctx.beginPath()
-        ctx.arc(cx + ox, cy + oy, R * 0.55, 0, Math.PI * 2)
-        ctx.fill()
-      }
+      const ox = Math.cos(t * 0.7) * R * 0.12
+      const oy = Math.sin(t * 0.9) * R * 0.1
+      const inner = ctx.createRadialGradient(cx + ox, cy + oy, 0, cx + ox, cy + oy, R * 0.7)
+      inner.addColorStop(0, `rgba(255,255,255,${0.55 + energy * 0.15})`)
+      inner.addColorStop(0.4, 'rgba(219, 234, 254, 0.25)')
+      inner.addColorStop(1, 'rgba(147, 197, 253, 0)')
+      ctx.fillStyle = inner
+      ctx.beginPath()
+      ctx.arc(cx + ox, cy + oy, R * 0.7, 0, Math.PI * 2)
+      ctx.fill()
       ctx.restore()
 
-      // Specular highlight
-      const hi = ctx.createRadialGradient(
-        cx - R * 0.3,
-        cy - R * 0.35,
-        0,
-        cx - R * 0.3,
-        cy - R * 0.35,
-        R * 0.45
-      )
-      hi.addColorStop(0, 'rgba(255,255,255,0.55)')
-      hi.addColorStop(0.35, 'rgba(255,255,255,0.12)')
-      hi.addColorStop(1, 'rgba(255,255,255,0)')
-      ctx.fillStyle = hi
+      // Tiny specular
+      ctx.fillStyle = 'rgba(255,255,255,0.65)'
       ctx.beginPath()
-      ctx.ellipse(cx - R * 0.22, cy - R * 0.28, R * 0.32, R * 0.2, -0.5, 0, Math.PI * 2)
+      ctx.ellipse(cx - R * 0.22, cy - R * 0.28, R * 0.18, R * 0.11, -0.5, 0, Math.PI * 2)
       ctx.fill()
 
       raf = requestAnimationFrame(draw)
@@ -719,7 +759,7 @@ function phaseLabel(p) {
   if (p === 'transcribing') return 'Got it'
   if (p === 'thinking') return 'Thinking'
   if (p === 'speaking') return 'Speaking'
-  return 'Voice'
+  return 'Live'
 }
 
 function LiveStrip() {
@@ -728,7 +768,6 @@ function LiveStrip() {
   const ghostText = useValue($ghostText)
   const ghostRole = useValue($ghostRole)
   const ghostOpacity = useValue($ghostOpacity)
-  const elapsed = useValue($elapsed)
   const error = useValue($error)
   const busOk = useValue($busOk)
 
@@ -745,108 +784,90 @@ function LiveStrip() {
 
   const listening = phase === 'listening' || phase === 'recording'
   const speaking = phase === 'speaking'
-  // Large soft orb — Grok/ChatGPT scale, full conversation cover
-  const orbSize = speaking ? 200 : listening ? 184 : 168
+  const thinking = phase === 'thinking' || phase === 'transcribing'
+  // ChatGPT Live center orb scale
+  const orbSize = speaking ? 168 : listening ? 156 : 148
   const showGhost = Boolean(ghostText) && ghostOpacity > 0.02
+  const dotOn = speaking ? 'speak' : thinking ? 'think' : 'listen'
 
   return jsxs('div', {
-    className: 'vh-session flex flex-col items-center justify-center gap-6 text-white/80',
+    className: 'vh-session',
     role: 'status',
     'aria-live': 'polite',
     'data-voice-hud': '1',
     'data-vh-phase': phase,
     children: [
-      // Minimal floating controls (ChatGPT Voice: mute/end style bar)
       jsxs('div', {
-        className:
-          'absolute top-5 left-1/2 z-[2] flex -translate-x-1/2 items-center gap-3 rounded-full border border-white/10 bg-black/40 px-4 py-2 backdrop-blur-xl',
+        className: 'vh-stage',
         children: [
           jsxs('div', {
-            className: 'flex items-center gap-2 text-[0.72rem] text-white/65',
+            className: 'vh-topbar',
             children: [
-              jsx('span', {
-                className: cn(
-                  'size-1.5 rounded-full',
-                  listening
-                    ? 'animate-pulse bg-emerald-400'
-                    : speaking
-                      ? 'animate-pulse bg-sky-400'
-                      : 'bg-amber-300/90'
-                )
+              jsxs('div', {
+                className: 'vh-live-pill',
+                children: [
+                  jsx('span', {
+                    className: 'vh-live-dot',
+                    'data-on': dotOn
+                  }),
+                  jsx('span', { children: 'Live' }),
+                  jsx('span', {
+                    className: 'text-[0.72rem] font-normal text-slate-500',
+                    children: phaseLabel(phase)
+                  })
+                ]
               }),
-              jsx('span', {
-                className: 'font-medium tracking-wide text-white/85',
-                children: phaseLabel(phase)
-              }),
-              jsx('span', {
-                className: 'font-mono tabular-nums text-white/40',
-                children: formatElapsed(elapsed / 1000)
+              jsx(Button, {
+                type: 'button',
+                size: 'sm',
+                variant: 'ghost',
+                className:
+                  'h-8 rounded-full px-3.5 text-[0.8rem] font-medium text-slate-700 hover:bg-slate-900/5',
+                'aria-label': 'Stop voice HUD',
+                'data-voice-hud-end': '1',
+                onClick: e => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  endVoice()
+                },
+                children: 'End'
               })
             ]
           }),
-          jsx('span', { className: 'h-3 w-px bg-white/15', 'aria-hidden': true }),
-          jsx(Button, {
-            type: 'button',
-            size: 'sm',
-            variant: 'ghost',
-            className:
-              'h-7 rounded-full px-3.5 text-[0.72rem] text-white/90 hover:bg-white/10 hover:text-white',
-            'aria-label': 'Stop voice HUD',
-            'data-voice-hud-end': '1',
-            onClick: e => {
-              e.preventDefault()
-              e.stopPropagation()
-              endVoice()
+
+          jsx('div', {
+            className: 'flex flex-1 items-center justify-center',
+            children: jsx(VoiceOrb, { size: orbSize })
+          }),
+
+          jsx('div', {
+            className: 'vh-ghost flex min-h-[3.25rem] w-full max-w-md flex-col items-center px-6',
+            style: {
+              opacity: showGhost ? ghostOpacity : 0,
+              transform: showGhost ? `translateY(${(1 - ghostOpacity) * 8}px)` : 'translateY(6px)'
             },
-            children: 'End'
+            'aria-hidden': !showGhost,
+            children: showGhost
+              ? jsxs('div', {
+                  className: 'text-center',
+                  children: [
+                    jsx('div', {
+                      className:
+                        'mb-1 text-[0.65rem] font-medium uppercase tracking-[0.16em] text-slate-400',
+                      children: ghostRole === 'agent' ? 'ILO' : 'YOU'
+                    }),
+                    jsx('div', {
+                      className: 'line-clamp-3 text-[1.05rem] leading-snug text-slate-700',
+                      children: ghostText
+                    })
+                  ]
+                })
+              : jsx('div', {
+                  className: 'text-[0.85rem] text-slate-400',
+                  children: !busOk ? 'Starting Live…' : listening ? '' : phaseLabel(phase)
+                })
           })
         ]
-      }),
-
-      // Soft orb center stage
-      jsx('div', {
-        className: cn(
-          'flex flex-1 items-center justify-center pt-10 transition-transform duration-500 ease-out',
-          speaking ? 'scale-[1.04]' : 'scale-100'
-        ),
-        children: jsx(VoiceOrb, { size: orbSize })
-      }),
-
-      // Ephemeral caption — words appear then dissolve (not a transcript panel)
-      jsx('div', {
-        className: 'vh-ghost flex min-h-[4rem] w-full max-w-lg flex-col items-center px-6 pb-8',
-        style: {
-          opacity: showGhost ? ghostOpacity : 0,
-          transform: showGhost ? `translateY(${(1 - ghostOpacity) * 10}px)` : 'translateY(8px)'
-        },
-        'aria-hidden': !showGhost,
-        children: showGhost
-          ? jsxs('div', {
-              className: 'text-center',
-              children: [
-                jsx('div', {
-                  className: 'mb-1.5 text-[0.6rem] font-medium uppercase tracking-[0.2em] text-white/35',
-                  children: ghostRole === 'agent' ? 'ILO' : 'YOU'
-                }),
-                jsx('div', {
-                  className: cn(
-                    'line-clamp-3 text-[1.1rem] font-normal leading-relaxed tracking-tight',
-                    ghostRole === 'agent' ? 'text-sky-50/90' : 'text-white/88'
-                  ),
-                  children: ghostText
-                })
-              ]
-            })
-          : jsx('div', {
-              className: 'text-center text-[0.8rem] tracking-wide text-white/30',
-              children: !busOk
-                ? 'Connecting voice…'
-                : speaking
-                  ? ''
-                  : listening
-                    ? 'Listening'
-                    : phaseLabel(phase)
-            })
       })
     ]
   })
@@ -857,8 +878,8 @@ function StatusChip() {
   const phase = useValue($phase)
   return jsx(Tip, {
     label: active
-      ? 'Orb voice skin — Stop ends session'
-      : 'Voice HUD: ChatGPT/Grok-style orb. Settings → Plugins.',
+      ? 'ChatGPT Live–style voice — End stops session'
+      : 'Voice HUD: ChatGPT Live stage. Settings → Plugins.',
     children: jsx('button', {
       type: 'button',
       className: cn(
@@ -871,7 +892,7 @@ function StatusChip() {
       },
       children: jsx(Badge, {
         variant: active ? 'default' : 'muted',
-        children: active ? `orb ${phase}` : 'orb'
+        children: active ? `live ${phase}` : 'live'
       })
     })
   })
@@ -906,7 +927,7 @@ export default {
         data: {
           id: 'voice-hud.toggle',
           action: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle orb voice',
+          label: 'Voice HUD: Toggle Live voice',
           keywords: ['voice', 'hud', 'orb', 'chatgpt', 'grok'],
           run: () => toggleVoice()
         }
@@ -926,7 +947,7 @@ export default {
         area: KEYBINDS_AREA,
         data: {
           id: 'voice-hud.toggle',
-          label: 'Voice HUD: Toggle orb voice',
+          label: 'Voice HUD: Toggle Live voice',
           category: 'Voice',
           defaults: ['mod+shift+v'],
           run: () => toggleVoice()
